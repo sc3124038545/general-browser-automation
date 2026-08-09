@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python main.py --prompt \"查询8月4日从成都到深圳的机票\")",
+      "Bash(python fix_date_picker.py)",
+      "Bash(rm -f fix_date_picker.py fix_both.py)",
+      "Bash(python -c ' *)",
+      "Bash(taskkill /F /IM chrome.exe)",
+      "Bash(\"C:\\\\Program Files \\(x86\\)\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe\" --remote-debugging-port=9222 --no-first-run --no-default-browser-check)",
+      "Bash(curl -s http://localhost:9222/json/version)",
+      "Bash(mkdir -p \"C:\\\\Temp\\\\chrome-debug-profile\")",
+      "Bash(\"C:\\\\Program Files \\(x86\\)\\\\Google\\\\Chrome\\\\Application\\\\chrome.exe\" --remote-debugging-port=9222 --user-data-dir=\"C:\\\\Temp\\\\chrome-debug-profile\" --no-first-run --no-default-browser-check)",
+      "Bash(python main.py --prompt \"查询8月5日成都到深圳的机票\")"
+    ]
+  }
+}
