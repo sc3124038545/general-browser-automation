@@ -77,8 +77,19 @@ class ToolCallAgent(ReActAgent):
         )
         content = response.content if response and response.content else ""
 
+        # 提取深度思考模式的推理过程（qwen3.7-max 等模型的 reasoning_content）
+        # reasoning_content 包含模型的内部推理，content 可能为空或只有最终总结
+        reasoning_content = ""
+        if response:
+            reasoning_content = getattr(response, 'reasoning_content', None) or ""
+            if not reasoning_content and hasattr(response, 'model_extra'):
+                reasoning_content = (response.model_extra or {}).get('reasoning_content', "")
+
+        # 用于显示的思考内容：content 优先，为空时使用 reasoning_content
+        display_content = content or reasoning_content
+
         # 记录响应信息
-        logger.info(f"✨ {self.name}'s thoughts: {content}")
+        logger.info(f"✨ {self.name}'s thoughts: {display_content}")
         logger.info(
             f"🛠️ {self.name} selected {len(tool_calls) if tool_calls else 0} tools to use"
         )

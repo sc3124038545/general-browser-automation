@@ -770,9 +770,21 @@ class LLM:
                 )
 
             params["stream"] = False  # 对于工具请求，始终使用非流式传输
-            response: ChatCompletion = await self.client.chat.completions.create(
-                **params
-            )
+
+            try:
+                response: ChatCompletion = await self.client.chat.completions.create(
+                    **params
+                )
+            except APIError as api_err:
+                error_msg = str(api_err)
+                # 检测 thinking 模式下 tool_choice 不兼容的错误
+                if "tool_choice" in error_msg and ("thinking mode" in error_msg or "InvalidParameter" in error_msg):
+                    logger.warning(f"[ask_tool] 模型在 thinking 模式下不支持 tool_choice={params.get('tool_choice')}，尝试不带 tool_choice 重试")
+                    # 移除 tool_choice 后重试（只重试一次，不通过 @retry 装饰器）
+                    params.pop("tool_choice", None)
+                    response = await self.client.chat.completions.create(**params)
+                else:
+                    raise
 
             # 检查响应是否有效
             if not response.choices or not response.choices[0].message:

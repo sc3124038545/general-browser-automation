@@ -152,6 +152,7 @@ class BrowserUseTool(BaseTool, Generic[Context]):
     # === 反检测：跟踪重复访问记录，用于死循环检测 ===
     _page_history: list = []
     _chrome_auto_launched: bool = False  # 防止重复启动
+    _chrome_launched_by_us: bool = False  # 标记是否由本工具启动 Chrome，决定 cleanup 时是否关闭
 
     @staticmethod
     def _find_chrome_path() -> Optional[str]:
@@ -233,6 +234,7 @@ class BrowserUseTool(BaseTool, Generic[Context]):
                     if resp.status_code == 200:
                         logger.info(f"[chrome] CDP 已就绪（等待 {i*0.5:.1f} 秒）")
                         self._chrome_auto_launched = True
+                        self._chrome_launched_by_us = True  # 由本工具启动，cleanup 时需要关闭
                         return
             except Exception:
                 pass
@@ -983,10 +985,17 @@ Page content:
 - 仔细观察截图，找到目标元素的边界，然后计算中心坐标
 """
 
-            # 3. 调用 GUI-Plus 模型
-            # 使用配置中的 API key 和 base_url
-            api_key = os.getenv("DASHSCOPE_API_KEY") or config.llm.get("default", {}).get("api_key", "")
-            base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            # 3. 调用视觉模型（配置来源：[llm.vision] > [llm.default] > 环境变量兜底）
+            import os
+            vision_config = config.llm.get("vision", config.llm.get("default"))
+            # LLMSettings 是 pydantic 对象，所有字段都有默认值，直接用属性访问
+            api_key = vision_config.api_key or os.getenv("DASHSCOPE_API_KEY", "")
+            base_url = vision_config.base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            model = vision_config.model or "gui-plus"
+            # 防止误配成图片生成模型（这些模型不支持 image+text 混合输入）
+            if "image" in model.lower():
+                logger.warning(f"[GUI-Plus] 模型 '{model}' 是图片生成模型，不支持视觉理解，已回退为 gui-plus")
+                model = "gui-plus"
 
             client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
@@ -1001,10 +1010,10 @@ Page content:
                 },
             ]
 
-            logger.info(f"[GUI-Plus] Calling model with instruction: {vision_instruction}")
+            logger.info(f"[GUI-Plus] Calling model '{model}' with instruction: {vision_instruction}")
 
             completion = await client.chat.completions.create(
-                model="gui-plus",
+                model=model,
                 messages=messages,
             )
 
@@ -1012,24 +1021,48 @@ Page content:
             logger.info(f"[GUI-Plus] Model response: {response_content}")
 
             # 4. 解析 JSON 响应
-            # 预处理：修复 {"x": 139, 675} 这种格式 -> {"x": 139, "y": 675}
+            # 视觉模型返回的 JSON 格式经常不规范，需要多层预处理修复
+            # 已知不规范模式：
+            #   (a) "points": [190, 258] — 用 points 键名代替 x/y
+            #   (b) "x": [139, 675] — x 被写成数组
+            #   (c) "y": [413] — y 被写成单元素数组
+            #   (d) "x": 342, 807] — 缺少 "y": 键名，且用 ] 闭合对象
+            #   (e) 残留的 ] 在数字后 — 模型误将 } 写成 ]
+
+            fixed_response = response_content
+
+            # (a) "points": [x, y] → "x": x, "y": y（必须在其他修复之前，因为这是合法的 []）
             fixed_response = re.sub(
-                r'"x":\s*(\d+),\s*(\d+)\s*[,}]',
-                lambda m: f'"x": {m.group(1)}, "y": {m.group(2)}' + (',' if m.group(0).endswith(',') else '}'),
-                response_content
+                r'"points":\s*\[(\d+),\s*(\d+)\]',
+                r'"x": \1, "y": \2',
+                fixed_response
             )
-            # 修复 {"x": [139, 675]} 这种格式 -> {"x": 139, "y": 675}
+            # (b) "x": [N, M] → "x": N, "y": M
             fixed_response = re.sub(
                 r'"x":\s*\[(\d+),\s*(\d+)\]',
                 r'"x": \1, "y": \2',
                 fixed_response
             )
-            # 修复 {"x": [598, 206], "y": [413, 206]} 这种格式 - 移除 y 的数组包装
+            # (c) "y": [N] → "y": N
             fixed_response = re.sub(
                 r'"y":\s*\[(\d+)\]',
                 r'"y": \1',
                 fixed_response
             )
+            # (d) "x": N, M 后跟 , 或 } 或 ] → "x": N, "y": M（保留原始终止符）
+            fixed_response = re.sub(
+                r'"x":\s*(\d+),\s*(\d+)\s*([,}\]])',
+                lambda m: f'"x": {m.group(1)}, "y": {m.group(2)}{m.group(3)}',
+                fixed_response
+            )
+            # (e) 修复数字后跟 ] 的模式（] 通常是模型幻觉多写的字符）
+            # 情况1: ] 后跟逗号 → 去掉 ]，JSON 对象还需继续
+            fixed_response = re.sub(r'(\d+)\]\s*,', r'\1,', fixed_response)
+            # 情况2: ] 后跟 } → 去掉 ]（] 是多余的）
+            fixed_response = re.sub(r'(\d+)\]\s*}', r'\1}', fixed_response)
+            # 情况3: ] 在字符串末尾 → 替换为 }（闭合整个 JSON 对象）
+            fixed_response = re.sub(r'(\d+)\]\s*$', r'\1}', fixed_response)
+
             if fixed_response != response_content:
                 logger.warning(f"[GUI-Plus] Fixed JSON format: {fixed_response[:200]}")
 
@@ -1077,6 +1110,22 @@ Page content:
             action_type = result.get("action", "").strip().upper()
             params = result.get("parameters", {})
             thought = result.get("thought", "")
+
+            # 标准化坐标：视觉模型可能用不同的键名/结构返回坐标
+            # (a) "points": [x, y] → x, y
+            # (b) 坐标在 result 根级别而不在 params 中
+            if isinstance(params, dict):
+                if params.get("x") is None and params.get("y") is None:
+                    pts = params.get("points") or result.get("points")
+                    if pts and isinstance(pts, list) and len(pts) >= 2:
+                        params["x"], params["y"] = pts[0], pts[1]
+                        logger.warning(f"[GUI-Plus] Converted 'points' [{pts[0]}, {pts[1]}] to x/y")
+                if params.get("x") is None and params.get("y") is None:
+                    if result.get("x") is not None:
+                        params = result
+                        logger.warning(f"[GUI-Plus] Using coordinates from result root")
+            elif not params and result.get("x") is not None:
+                params = result
 
             # 如果没有 action 但有坐标，推断 action 类型
             if not action_type:
@@ -1282,6 +1331,18 @@ Page content:
             logger.error(f"[GUI-Plus] Execution failed: {e}")
             import traceback
             traceback.print_exc()
+            # 检测视觉模型配额耗尽等可识别错误
+            error_str = str(e)
+            if "Free quota exhausted" in error_str or "AllocationQuota" in error_str:
+                return ToolResult(
+                    error=f"[vision] 视觉模型免费配额已用完，无法使用视觉识别点击。"
+                          f"请改用以下方式：1) 尝试用 JavaScript 方式定位元素（通过 go_to_url 重新加载页面后元素信息会更新）"
+                          f"2) 使用 web_search 搜索替代信息 3) 尝试其他网站"
+                )
+            if "tool_choice" in error_str and "thinking mode" in error_str:
+                return ToolResult(
+                    error=f"[vision] 当前模型不支持视觉工具调用，请降级使用 JavaScript 方式定位元素"
+                )
             return ToolResult(error=f"[vision] 执行失败: {str(e)}")
 
     async def _execute_smart_click(
@@ -2129,10 +2190,23 @@ Page content:
             if self.browser is not None:
                 try:
                     await self.browser.close()
-                    logger.debug("[browser] Browser connection closed")
+                    logger.info("[browser] 浏览器连接已关闭")
                 except Exception as e:
                     logger.debug(f"[browser] Browser close error (non-critical): {e}")
                 self.browser = None
+
+            # 如果 Chrome 是由本工具自动启动的，任务完成后关闭浏览器窗口
+            if self._chrome_launched_by_us:
+                try:
+                    import subprocess
+                    subprocess.run(
+                        ["taskkill", "/F", "/IM", "chrome.exe"],
+                        capture_output=True, timeout=5
+                    )
+                    logger.info("[chrome] 已关闭自动启动的 Chrome 浏览器")
+                except Exception as e:
+                    logger.debug(f"[chrome] Chrome 关闭失败（非关键）: {e}")
+                self._chrome_launched_by_us = False
 
     def __del__(self):
         """确保在对象销毁时进行清理。"""

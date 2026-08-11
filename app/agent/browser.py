@@ -73,8 +73,8 @@ class BrowserContextHelper:
             raw_elements = browser_state.get("interactive_elements", "")
             element_count = browser_state.get("element_count", 0)
 
-            # 如果页面有较多元素（>30），说明是结果页，提取文本给 LLM 分析
-            if element_count > 30 and raw_elements:
+            # 如果页面有较多元素（>=30），说明是结果页，提取文本给 LLM 分析
+            if element_count >= 30 and raw_elements:
                 # 截断过长的元素文本，保留前 8000 字符
                 if len(raw_elements) > 8000:
                     raw_elements = raw_elements[:8000] + "\n...(内容过长已截断)"

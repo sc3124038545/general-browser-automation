@@ -1,3 +1,4 @@
+import json
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from typing import List, Optional
@@ -131,27 +132,48 @@ class BaseAgent(BaseModel, ABC):
         if request:
             self.update_memory("user", request)
 
-        results: List[str] = []
         async with self.state_context(AgentState.RUNNING):
             while (
                 self.current_step < self.max_steps and self.state != AgentState.FINISHED
             ):
                 self.current_step += 1
                 logger.info(f"Executing step {self.current_step}/{self.max_steps}")
-                step_result = await self.step()
+                await self.step()
 
                 # 检查是否卡住
                 if self.is_stuck():
                     self.handle_stuck_state()
 
-                results.append(f"Step {self.current_step}: {step_result}")
-
             if self.current_step >= self.max_steps:
                 self.current_step = 0
                 self.state = AgentState.IDLE
-                results.append(f"Terminated: Reached max steps ({self.max_steps})")
+                await SANDBOX_CLIENT.cleanup()
+                return f"Terminated: Reached max steps ({self.max_steps})"
+
         await SANDBOX_CLIENT.cleanup()
-        return "\n".join(results) if results else "No steps executed"
+
+        # 任务正常完成（terminate），优先从 terminate 工具参数中提取 output
+        # 这样可以获取 agent 准备的最终答案，而不是内部思考过程
+        for msg in reversed(self.memory.messages):
+            if msg.role == "assistant" and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    if tc.function.name.lower() == "terminate":
+                        try:
+                            args = json.loads(tc.function.arguments or "{}")
+                            output = args.get("output", "")
+                            if output and output.strip():
+                                return output.strip()
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+
+        # 回退：从 memory 提取最后一条有实质内容的 assistant 消息
+        for msg in reversed(self.memory.messages):
+            if msg.role == "assistant" and msg.content:
+                content = msg.content.strip()
+                if content:
+                    return content
+
+        return "Task completed"
 
     @abstractmethod
     async def step(self) -> str:

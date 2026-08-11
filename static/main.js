@@ -71,53 +71,114 @@ function setupSSE(taskId, isLongThought) {
     const maxRetries = 3;
     const retryDelay = 2000;
     let lastResultContent = '';
+    let thoughtSectionCreated = false;
+
+    function ensureThoughtSection() {
+        if (thoughtSectionCreated) return;
+        thoughtSectionCreated = true;
+
+        aiMessageDiv = document.createElement('div');
+        aiMessageDiv.className = 'message ai-message';
+
+        const iconDiv = document.createElement('div');
+        iconDiv.className = 'message-icon';
+        const icon = document.createElement('i');
+        icon.className = 'bi bi-robot';
+        iconDiv.appendChild(icon);
+
+        const contentDiv = document.createElement('div');
+        contentDiv.className = 'message-content';
+
+        thoughtQuote = document.createElement('div');
+        thoughtQuote.className = 'thought-quote';
+        thoughtQuote.innerHTML = `
+            <div class="quote-header">
+                <span>思考过程</span>
+                <span class="toggle-icon expanded"><i class="bi bi-chevron-down"></i></span>
+            </div>
+            <div class="quote-content"></div>
+        `;
+
+        finalAnswer = document.createElement('div');
+        finalAnswer.className = 'ai-final-answer';
+
+        contentDiv.appendChild(thoughtQuote);
+        contentDiv.appendChild(finalAnswer);
+
+        aiMessageDiv.appendChild(iconDiv);
+        aiMessageDiv.appendChild(contentDiv);
+
+        chatMessages.appendChild(aiMessageDiv);
+        scrollView();
+
+        thoughtQuote.addEventListener('click', function (e) {
+            if (e.target.closest('.quote-header')) {
+                const isCollapsing = !this.classList.contains('collapsed');
+                this.classList.toggle('collapsed');
+                const icon = this.querySelector('.toggle-icon');
+                icon.innerHTML = isCollapsing ? '<i class="bi bi-chevron-up"></i>' : '<i class="bi bi-chevron-down"></i>';
+            }
+        });
+    }
 
     function connect() {
         const eventSource = new EventSource(`/tasks/${taskId}/events`);
         currentEventSource = eventSource;
 
-        const handleEvent = (event, type) => {
+        // 思考过程事件
+        eventSource.addEventListener('think', (event) => {
             try {
                 const data = JSON.parse(event.data);
-                if (!isLongThought) {
-                    if (type === 'act') {
-                        addMessage(data.result, 'ai')
-                    }
-                    return;
-                }
+                console.log('[SSE] think event received, length:', data.result ? data.result.length : 0);
+                ensureThoughtSection();
 
-                if (type === 'log' && data.result.indexOf('Executing step') > -1) {
-                    createLongThought(data.result);
-                } else if (type === 'act') {
-                    finalAnswer.textContent = data.result
-                } else {
-                    const stepDiv = document.createElement('div');
-                    stepDiv.className = 'thinking-message';
-                    stepDiv.textContent = data.result;
-                    thoughtQuote.querySelector('.quote-content').appendChild(stepDiv);
-                }
+                const stepDiv = document.createElement('div');
+                stepDiv.className = 'thinking-message';
+                stepDiv.textContent = data.result;
+                thoughtQuote.querySelector('.quote-content').appendChild(stepDiv);
+                scrollView();
             } catch (e) {
-                console.error(`Error handling ${type} event:`, e);
+                console.error('Error handling think event:', e);
             }
-        };
-
-        const eventTypes = ['think', 'tool', 'act', 'log', 'run', 'message'];
-        eventTypes.forEach(type => {
-            eventSource.addEventListener(type, (event) => handleEvent(event, type));
         });
 
+        // 任务执行失败
+        eventSource.addEventListener('task_error', (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                const errorMsg = data.message || '未知错误';
+                ensureThoughtSection();
+                if (finalAnswer) {
+                    finalAnswer.innerHTML = '<div class="text-danger"><strong>执行失败：</strong>' + errorMsg + '</div>';
+                }
+                scrollView();
+                eventSource.close();
+                currentEventSource = null;
+                showErrorToast(errorMsg);
+            } catch (e) {
+                console.error('Error handling task_error event:', e);
+            }
+            toggle_chat_state('none');
+        });
+
+        // 最终结果
         eventSource.addEventListener('complete', (event) => {
             try {
                 const data = JSON.parse(event.data);
                 lastResultContent = data.result || '';
 
                 if (lastResultContent) {
-                    if (isLongThought) {
+                    if (thoughtSectionCreated && finalAnswer) {
+                        // 折叠思考过程，只展示最终结果（用户可点击展开回顾思考过程）
+                        if (thoughtQuote && !thoughtQuote.classList.contains('collapsed')) {
+                            thoughtQuote.classList.add('collapsed');
+                            const icon = thoughtQuote.querySelector('.toggle-icon');
+                            if (icon) icon.innerHTML = '<i class="bi bi-chevron-up"></i>';
+                        }
                         finalAnswer.innerHTML = getMarkedText(lastResultContent);
                     } else {
                         addMessage(lastResultContent, 'ai');
                     }
-                    // console.log(lastResultContent);
                 }
                 scrollView();
                 eventSource.close();
@@ -128,16 +189,15 @@ function setupSSE(taskId, isLongThought) {
             toggle_chat_state('none');
         });
 
+        // SSE 传输层错误（如后端异常断开）
         eventSource.addEventListener('error', (event) => {
-            try {
-                console.error(event)
-                const data = JSON.parse(event.data);
-                showErrorToast(data.message)
-                eventSource.close();
-                currentEventSource = null;
-                toggle_chat_state('none');
-            } catch (e) {
-                console.error('Error handling failed:', e);
+            if (event.data) {
+                try {
+                    const data = JSON.parse(event.data);
+                    showErrorToast(data.message || '连接错误');
+                } catch (e) {
+                    console.error('Error parsing SSE error event:', e);
+                }
             }
         });
 
@@ -150,19 +210,20 @@ function setupSSE(taskId, isLongThought) {
             fetch(`/tasks/${taskId}`)
                 .then(response => response.json())
                 .then(task => {
-                    if (task.status === 'completed' || task.status === 'failed') {
-                        if (task.status === 'completed') {
-                            // TODO
-                        } else {
-                            console.error(task)
-                            showErrorToast(task.error)
+                    if (task.status === 'completed') {
+                        // 已通过 complete 事件处理
+                    } else if (task.status && task.status.startsWith('failed')) {
+                        ensureThoughtSection();
+                        if (finalAnswer) {
+                            finalAnswer.innerHTML = '<div class="text-danger"><strong>执行失败：</strong>' + (task.error || task.status) + '</div>';
                         }
+                        showErrorToast(task.error || task.status);
                     } else if (retryCount < maxRetries) {
                         retryCount++;
-                        showErrorToast(`Connection lost, retrying in ${retryDelay / 1000} seconds (${retryCount}/${maxRetries})`)
+                        showErrorToast(`连接断开，${retryDelay / 1000}秒后重连 (${retryCount}/${maxRetries})`)
                         setTimeout(connect, retryDelay);
                     } else {
-                        showErrorToast('Connection lost, please try refreshing the page')
+                        showErrorToast('连接断开，请刷新页面重试')
                     }
                 })
                 .catch(error => {

@@ -75,6 +75,7 @@ class TaskManager:
             await self.queues[task_id].put(
                 {"type": "status", "status": task.status, "steps": task.steps}
             )
+            print(f"[Queue] 队列大小: {self.queues[task_id].qsize()} (type={step_type})", flush=True)
 
     async def complete_task(self, task_id: str, result: str):
         if task_id in self.tasks:
@@ -88,7 +89,7 @@ class TaskManager:
     async def fail_task(self, task_id: str, error: str):
         if task_id in self.tasks:
             self.tasks[task_id].status = f"failed: {error}"
-            await self.queues[task_id].put({"type": "error", "message": error})
+            await self.queues[task_id].put({"type": "task_error", "message": error})
 
 
 task_manager = TaskManager()
@@ -125,57 +126,43 @@ async def run_task(task_id: str, prompt: str):
             description="A versatile agent that can solve various tasks using multiple tools",
         )
 
-        async def on_think(thought):
-            await task_manager.update_task_step(task_id, 0, thought, "think")
-
-        async def on_tool_execute(tool, input):
-            await task_manager.update_task_step(
-                task_id, 0, f"Executing tool: {tool}\nInput: {input}", "tool"
-            )
-
-        async def on_action(action):
-            await task_manager.update_task_step(
-                task_id, 0, f"Executing action: {action}", "act"
-            )
-
-        async def on_run(step, result):
-            await task_manager.update_task_step(task_id, step, result, "run")
-
         from app.logger import logger
 
         class SSELogHandler:
+            """只把思考过程推送到前端，工具执行细节只输出到终端
+            注意：loguru 会同步调用 handler，不能用 async def __call__，
+            必须用同步入口 + loop.create_task 调度异步任务"""
+
             def __init__(self, task_id):
                 self.task_id = task_id
+                self._loop = asyncio.get_running_loop()
 
-            async def __call__(self, message):
+            def __call__(self, message):
                 import re
 
-                # Extract - Subsequent Content
                 cleaned_message = re.sub(r"^.*? - ", "", message)
 
-                event_type = "log"
+                # 只推送思考过程到前端
                 if "✨ Manus's thoughts:" in cleaned_message:
-                    event_type = "think"
-                elif "🛠 Manus selected" in cleaned_message:
-                    event_type = "tool"
-                elif "🎯 Tool" in cleaned_message:
-                    event_type = "act"
-                elif "📝 Oops!" in cleaned_message:
-                    event_type = "error"
-                elif "🏁 Special tool" in cleaned_message:
-                    event_type = "complete"
-
-                await task_manager.update_task_step(
-                    self.task_id, 0, cleaned_message, event_type
-                )
+                    thought_text = cleaned_message.split("✨ Manus's thoughts:", 1)[-1].strip()
+                    if thought_text:
+                        try:
+                            self._loop.create_task(
+                                task_manager.update_task_step(
+                                    self.task_id, 0, thought_text, "think"
+                                )
+                            )
+                            print(f"[SSE] 已推送思考过程 ({len(thought_text)} 字符)", flush=True)
+                        except Exception as exc:
+                            print(f"[SSELogHandler] 推送失败: {exc}", flush=True)
 
         sse_handler = SSELogHandler(task_id)
         hwnd = logger.add(sse_handler)
 
         result = await agent.run(prompt)
         logger.remove(hwnd)
-        await task_manager.update_task_step(task_id, 1, result, "result")
-        await asyncio.sleep(3)
+
+        # 推送最终结果到前端
         await task_manager.complete_task(task_id, result)
     except Exception as e:
         await task_manager.fail_task(task_id, str(e))
@@ -196,27 +183,28 @@ async def task_events(task_id: str):
 
         while True:
             try:
-                event = await queue.get()
+                # 用超时替代无限阻塞，定期发心跳保持 SSE 连接
+                event = await asyncio.wait_for(queue.get(), timeout=15)
                 formatted_event = dumps(event)
-
-                yield ": heartbeat\n\n"
 
                 if event["type"] == "complete":
                     yield f"event: complete\ndata: {formatted_event}\n\n"
+                    # 留时间给浏览器处理 complete 事件再断开
+                    await asyncio.sleep(0.5)
+                    break
+                elif event["type"] == "task_error":
+                    yield f"event: task_error\ndata: {formatted_event}\n\n"
+                    await asyncio.sleep(0.5)
                     break
                 elif event["type"] == "error":
                     yield f"event: error\ndata: {formatted_event}\n\n"
                     break
-                elif event["type"] == "step":
-                    task = task_manager.tasks.get(task_id)
-                    if task:
-                        yield f"event: status\ndata: {dumps({'type': 'status', 'status': task.status, 'steps': task.steps})}\n\n"
-                    yield f"event: {event['type']}\ndata: {formatted_event}\n\n"
-                elif event["type"] in ["think", "tool", "act", "run"]:
-                    yield f"event: {event['type']}\ndata: {formatted_event}\n\n"
                 else:
                     yield f"event: {event['type']}\ndata: {formatted_event}\n\n"
 
+            except asyncio.TimeoutError:
+                # 定期心跳，防止代理/浏览器断开连接
+                yield ": heartbeat\n\n"
             except asyncio.CancelledError:
                 print(f"Client disconnected for task {task_id}")
                 break
