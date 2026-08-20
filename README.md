@@ -19,7 +19,7 @@ OpenManus 是一个开源的 AI Agent 框架，能够使用多种工具（浏览
 ## 项目结构
 
 ```
-OpenManus-gui/
+general-browser-automation/
 ├── app.py                    # Web GUI 主入口（FastAPI + SSE）
 ├── main.py                   # CLI 命令行入口
 ├── run_flow.py               # 多 Agent 协作流程入口
@@ -87,6 +87,8 @@ OpenManus-gui/
 │   ├── schema.py             # 数据模型（Message、Memory、AgentState 等）
 │   ├── logger.py             # 日志管理
 │   ├── bedrock.py            # AWS Bedrock 客户端
+│   ├── knowledge/            # 浏览器操作知识库
+│   ├── utils/                # 通用工具函数（文件操作、结构化日志）
 │   └── exceptions.py         # 自定义异常
 │
 ├── config/                   # 配置文件
@@ -122,8 +124,8 @@ OpenManus-gui/
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/FoundationAgents/OpenManus.git
-cd OpenManus
+git clone https://github.com/sc3124038545/general-browser-automation.git
+cd general-browser-automation
 
 # 2. 创建虚拟环境并激活
 uv venv --python 3.12
@@ -147,8 +149,8 @@ conda create -n openmanus python=3.12
 conda activate openmanus
 
 # 2. 克隆仓库并安装
-git clone https://github.com/FoundationAgents/OpenManus.git
-cd OpenManus
+git clone https://github.com/sc3124038545/general-browser-automation.git
+cd general-browser-automation
 pip install -r requirements.txt
 
 # 3. 安装浏览器驱动

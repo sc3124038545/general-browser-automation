@@ -7,7 +7,6 @@
       name="viewport"
       content="width=device-width,initial-scale=1.0,minimum-scale=1.0,maximum-scale=1.0,user-scalable=no"
     />
-    <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
     <title>Open Manus</title>
     <link href="static/bootstrap.min.css" rel="stylesheet" />
     <link
@@ -175,19 +174,19 @@
               <textarea
                 class="form-control"
                 id="messageInput"
-                placeholder="Ask Manus..."
+                placeholder="请问 Manus..."
               ></textarea>
               <div class="long-thought-toggle">
                 <input type="checkbox" id="longThoughtCheckbox" checked />
                 <label for="longThoughtCheckbox"
-                  ><span style="margin-left: 6px">Thinking</span></label
+                  ><span style="margin-left: 6px">显示思考过程</span></label
                 >
                 <button
                   class="btn btn-history"
                   id="btn-history"
                   data-bs-toggle="tooltip"
                   data-bs-placement="top"
-                  data-bs-title="History Chat"
+                  data-bs-title="历史记录"
                 >
                   <i class="bi bi-clock-history"></i>
                 </button>
@@ -196,7 +195,7 @@
                   id="btn-chat"
                   data-bs-toggle="tooltip"
                   data-bs-placement="top"
-                  data-bs-title="New Chat"
+                  data-bs-title="新建对话"
                 >
                   <i class="bi bi-chat-dots"></i>
                 </button>
@@ -205,7 +204,7 @@
                   id="btn-paperclip"
                   data-bs-toggle="tooltip"
                   data-bs-placement="top"
-                  data-bs-title="Upload files"
+                  data-bs-title="上传文件"
                 >
                   <i class="bi bi-paperclip"></i>
                 </button>
@@ -221,7 +220,7 @@
                 id="sendButton"
                 data-bs-toggle="tooltip"
                 data-bs-placement="top"
-                data-bs-title="Send to Manus"
+                data-bs-title="发送给 Manus"
               >
                 <span
                   id="send-spinner"
@@ -235,18 +234,18 @@
 
             <div class="prompt-shortcuts">
               <span class="badge bg-light text-dark me-2 prompt-shortcut"
-                >What's the current price of AAPL?</span
+                >苹果(AAPL)当前股价是多少?</span
               >
               <span class="badge bg-light text-dark me-2 prompt-shortcut"
-                >Plan a 7 days trip in HK</span
+                >帮我规划香港 7 日游</span
               >
             </div>
             <div class="prompt-shortcuts">
               <span class="badge bg-light text-dark me-2 prompt-shortcut"
-                >What's the trends of today's AI Agent?</span
+                >今天 AI Agent 的发展趋势如何?</span
               >
               <span class="badge bg-light text-dark me-2 prompt-shortcut"
-                >How to start learning Python for a dummy?</span
+                >零基础如何开始学习 Python?</span
               >
             </div>
 
@@ -262,7 +261,7 @@
       <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content">
           <div class="modal-header">
-            <h5 class="modal-title">History Chats</h5>
+            <h5 class="modal-title">历史记录</h5>
             <button
               type="button"
               class="btn-close"
@@ -304,7 +303,7 @@
     <script src="static/marked.min.js"></script>
     <script src="static/bootstrap.bundle.min.js"></script>
     <script src="static/purify.min.js"></script>
-    <script src="static/main.js?v=20260811"></script>
+    <script src="static/main.js?v=20260820"></script>
     <script>
       function copyMessage(element) {
         const messageText = element

@@ -1,14 +1,17 @@
 import asyncio
+import json
 import os
+import re
 import threading
 import tomllib
 import uuid
 import webbrowser
-import json
 from datetime import datetime
 from functools import partial
 from json import dumps
 from pathlib import Path
+
+from app.logger import logger
 
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -75,12 +78,14 @@ class TaskManager:
             await self.queues[task_id].put(
                 {"type": "status", "status": task.status, "steps": task.steps}
             )
-            print(f"[Queue] 队列大小: {self.queues[task_id].qsize()} (type={step_type})", flush=True)
+            logger.debug(f"[Queue] 队列大小: {self.queues[task_id].qsize()} (type={step_type})")
 
     async def complete_task(self, task_id: str, result: str):
         if task_id in self.tasks:
             task = self.tasks[task_id]
             task.status = "completed"
+            # 将最终结果作为步骤持久化，供历史记录回放
+            task.steps.append({"step": 0, "result": result, "type": "result"})
             await self.queues[task_id].put(
                 {"type": "status", "status": task.status, "steps": task.steps}
             )
@@ -88,7 +93,10 @@ class TaskManager:
 
     async def fail_task(self, task_id: str, error: str):
         if task_id in self.tasks:
-            self.tasks[task_id].status = f"failed: {error}"
+            task = self.tasks[task_id]
+            task.status = f"failed: {error}"
+            # 将错误信息作为步骤持久化，供历史记录回放
+            task.steps.append({"step": 0, "result": error, "type": "error"})
             await self.queues[task_id].put({"type": "task_error", "message": error})
 
 
@@ -126,8 +134,6 @@ async def run_task(task_id: str, prompt: str):
             description="A versatile agent that can solve various tasks using multiple tools",
         )
 
-        from app.logger import logger
-
         class SSELogHandler:
             """只把思考过程推送到前端，工具执行细节只输出到终端
             注意：loguru 会同步调用 handler，不能用 async def __call__，
@@ -138,8 +144,6 @@ async def run_task(task_id: str, prompt: str):
                 self._loop = asyncio.get_running_loop()
 
             def __call__(self, message):
-                import re
-
                 cleaned_message = re.sub(r"^.*? - ", "", message)
 
                 # 只推送思考过程到前端
@@ -152,9 +156,9 @@ async def run_task(task_id: str, prompt: str):
                                     self.task_id, 0, thought_text, "think"
                                 )
                             )
-                            print(f"[SSE] 已推送思考过程 ({len(thought_text)} 字符)", flush=True)
+                            logger.debug(f"[SSE] 已推送思考过程 ({len(thought_text)} 字符)")
                         except Exception as exc:
-                            print(f"[SSELogHandler] 推送失败: {exc}", flush=True)
+                            logger.warning(f"[SSELogHandler] 推送失败: {exc}")
 
         sse_handler = SSELogHandler(task_id)
         hwnd = logger.add(sse_handler)
@@ -206,10 +210,10 @@ async def task_events(task_id: str):
                 # 定期心跳，防止代理/浏览器断开连接
                 yield ": heartbeat\n\n"
             except asyncio.CancelledError:
-                print(f"Client disconnected for task {task_id}")
+                logger.debug(f"Client disconnected for task {task_id}")
                 break
             except Exception as e:
-                print(f"Error in event stream: {str(e)}")
+                logger.warning(f"Error in event stream: {str(e)}")
                 yield f"event: error\ndata: {dumps({'message': str(e)})}\n\n"
                 break
 
@@ -322,7 +326,7 @@ def load_config():
     except FileNotFoundError:
         return {"host": "localhost", "port": 5172}
     except KeyError as e:
-        print(
+        logger.warning(
             f"The configuration file is missing necessary fields: {str(e)}, use default configuration"
         )
         return {"host": "localhost", "port": 5172}
