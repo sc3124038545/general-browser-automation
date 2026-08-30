@@ -26,8 +26,8 @@ structlog
 colorama>=0.4
 
 # === 浏览器自动化 ===
-playwright>=1.51
-browser-use>=0.1.40
+playwright>=1.62.0
+browser-use>=0.13.8
 pillow>=10.4
 
 # === 搜索引擎 ===
@@ -63,7 +63,7 @@ daytona-sdk
 
 # === 浏览器训练环境（browser-use 内部依赖） ===
 gymnasium>=1.1
-browsergym>=0.13
+browsergym>=0.14.3
 
 # === 开发/测试 ===
 pytest>=8.3
