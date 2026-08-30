@@ -33,7 +33,7 @@ pillow>=10.4
 # === 搜索引擎 ===
 googlesearch-python>=1.3
 duckduckgo_search>=7.5
-baidusearch>=1.0
+baidusearch>=1.0.3
 
 # === 网页处理 ===
 requests>=2.32
