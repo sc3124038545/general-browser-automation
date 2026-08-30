@@ -7,16 +7,16 @@
 # ============================================================
 
 # === 核心框架 ===
-pydantic>=2.10
-fastapi>=0.115
+pydantic>=2.13.4
+fastapi>=0.141.1
 uvicorn>=0.34
 httpx>=0.27
 aiofiles>=24.1
 
 # === LLM / API 客户端 ===
-openai>=1.66
+openai>=3.5.0
 tenacity>=9.0
-tiktoken>=0.9
+tiktoken>=0.14.0
 
 # === 配置与日志 ===
 tomli>=2.0
