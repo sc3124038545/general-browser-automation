@@ -9,6 +9,7 @@ OpenManus 是一个开源的 AI Agent 框架，能够使用多种工具（浏览
 - **ReAct 推理循环**: Agent 遵循 Think → Act → Observe 的标准范式，具备规划、执行和反思能力
 - **多模型支持**: 兼容 OpenAI、Azure OpenAI、阿里云 DashScope、Ollama、AWS Bedrock、Jiekou.AI 等多种 LLM API
 - **浏览器自动化**: 基于 Playwright，支持网页浏览、表单填写、数据抓取等操作
+- **动态网页交互**: 针对反爬、验证码、级联表单等复杂页面，内置五大场景能力——滑块/点选验证码、无限滚动比价、级联表单、多步骤长流程、iframe/Shadow DOM 穿透（受目标站点服务端风控影响，详见常见问题）
 - **Python 代码执行**: Agent 可以编写并运行 Python 代码来完成数据分析和计算任务
 - **文件编辑器**: 基于字符串替换的文件编辑工具，可对本地文件进行精确修改
 - **网络搜索**: 支持 Google、DuckDuckGo、Bing、百度等多种搜索引擎
@@ -178,7 +179,7 @@ api_key = "sk-xxxxxxxxxxxxxxxx"                  # 替换为你的 DashScope API
 max_tokens = 8192
 temperature = 0.0
 
-[llm.vision]
+[llm.vision]                                      # 视觉模型，仅滑块/点选验证码场景需要
 api_type = "openai"
 model = "qwen-vl-plus"
 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -209,6 +210,8 @@ api_key = "ollama"
 max_tokens = 4096
 temperature = 0.0
 ```
+
+> `[llm.vision]` 为视觉模型，仅滑块/点选验证码场景需要；级联表单、滚动比价等纯文本任务只需配置 `[llm]`。
 
 其他平台（Azure、AWS Bedrock、Jiekou.AI）的配置模板见 `config/` 目录下的 `config.example-model-*.toml` 文件。
 
@@ -327,6 +330,16 @@ BaseAgent（抽象基类）
 | Terminate | `app/tool/terminate.py` | 结束任务 |
 | MCPClientTool | `app/tool/mcp.py` | MCP 远程工具代理 |
 
+其中 `BrowserUseTool`（浏览器自动化）针对动态网页交互场景提供了以下专用动作：
+
+| 动作 | 场景 | 说明 |
+|------|------|------|
+| `solve_slider_captcha` | 滑块验证码 | 视觉识别缺口 + 拟人化轨迹拖拽（极验/易盾） |
+| `solve_click_captcha` | 点选验证码 | 视觉识别多个目标点并依次点击 |
+| `scroll_and_collect` | 滚动比价 | 无限滚动加载 + LLM 结构化抽取商品列表 |
+| `get_dropdown_options` / `select_dropdown_option` | 级联表单 | 读取/选择原生 `<select>`，自动触发级联刷新 |
+| `click` / `get_dropdown_options` / `select_dropdown_option`（增强） | iframe/Shadow DOM | 跨 iframe 定位 + 穿透 open shadow DOM |
+
 ### 多 Agent 流程
 
 `PlanningFlow` 是多 Agent 协作的核心实现：
@@ -389,7 +402,8 @@ class MyNewTool(BaseTool):
 
 - `workspace/` 目录是 Agent 运行时的工作目录，Agent 生成的文件会放在这里
 - `logs/` 目录存放运行日志
-- `debug_html/` 目录存放浏览器调试的 HTML 快照
+- `debug_html/` 目录存放浏览器自动化演示页（mock 验证码/级联表单/iframe 等场景）
+- `tests/` 目录存放各场景的端到端测试脚本
 - `cases/` 目录存放测试用例
 - `examples/` 目录存放示例代码
 
@@ -425,6 +439,16 @@ A: 确保 Docker 已安装并运行，且当前用户有 Docker 操作权限。
 
 **Q: Web 页面中文乱码？**
 A: Python 文件统一使用 UTF-8 编码，确保终端/浏览器编码设置正确。
+
+**Q: 滑块/点选验证码在极验、12306 上滑动成功但仍提示失败？**
+A: 极验（错误码 113）、12306 易盾（error:TJX9v）等服务端风控会在校验环节拒绝自动化请求，
+   属厂商的反自动化固有限制，与本地缺口识别、拖拽轨迹无关。自建 mock 页
+   （`debug_html/mock_*_captcha.html`）可完整验证求解逻辑；真实站点能否通过取决于对方风控策略。
+
+**Q: 电商比价在京东/淘宝/拼多多上被拦？**
+A: 各大电商反爬强度差异很大。京东、淘宝、拼多多基本会拦截自动化访问；苏宁、当当、
+   什么值得买等相对友好，可跑通滚动采集。建议先用 `debug_html/mock_scroll_list.html` 验证流程，
+   再针对目标站点评估反爬策略。
 
 ## 相关项目
 
