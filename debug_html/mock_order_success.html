@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>下单成功</title>
+<style>
+  body { font-family: "Microsoft YaHei", sans-serif; margin: 0; background: #f5f5f5; }
+  .container { max-width: 480px; margin: 60px auto; background: #fff; padding: 32px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); text-align: center; }
+  .icon { font-size: 48px; color: #67c23a; }
+  h2 { color: #333; margin: 12px 0; }
+  .detail { text-align: left; background: #f9f9f9; border-radius: 6px; padding: 16px; margin-top: 20px; font-size: 13px; line-height: 1.9; color: #555; }
+  .order-no { color: #e4393c; font-weight: bold; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="icon">✓</div>
+  <h2>下单成功</h2>
+  <div class="detail" id="detail"></div>
+</div>
+<script>
+  var qs = new URLSearchParams(location.search);
+  var detail = document.getElementById('detail');
+  detail.innerHTML =
+    '<b>订单号</b>：<span class="order-no">' + (qs.get('order_no') || '') + '</span><br>' +
+    '<b>商品</b>：' + (qs.get('product') || '') + '<br>' +
+    '<b>收货人</b>：' + (qs.get('name') || '') + '<br>' +
+    '<b>手机</b>：' + (qs.get('phone') || '') + '<br>' +
+    '<b>地址</b>：' + (qs.get('address') || '') + '<br>' +
+    '<b>支付方式</b>：' + (qs.get('pay') || '');
+</script>
+</body>
+</html>

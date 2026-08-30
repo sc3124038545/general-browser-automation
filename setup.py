@@ -21,6 +21,7 @@ setup(
         "pyyaml~=6.0.2",
         "loguru~=0.7.3",
         "numpy",
+        "opencv-python-headless>=4.10,<6",
         "datasets>=3.2,<3.5",
         "html2text~=2024.2.26",
         "gymnasium>=1.0,<1.2",

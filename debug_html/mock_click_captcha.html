@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>点选验证码演示</title>
+<style>
+  body {
+    font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+    background: #f0f2f5;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    margin: 0;
+  }
+  .geetest_widget {
+    background: #fff;
+    border-radius: 10px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.12);
+    padding: 28px 32px;
+    text-align: center;
+  }
+  .geetest_radar_btn {
+    display: inline-block;
+    background: #fff;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    padding: 10px 28px;
+    font-size: 15px;
+    color: #333;
+    cursor: pointer;
+    user-select: none;
+  }
+  .geetest_radar_btn:hover { background: #f9fafb; }
+  .geetest_panel {
+    display: none;
+    margin-top: 20px;
+  }
+  .geetest_tips {
+    font-size: 18px;
+    font-weight: bold;
+    color: #1f2937;
+    margin-bottom: 14px;
+  }
+  .geetest_fullpage_click {
+    display: inline-block;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    background: #fafafa;
+    line-height: 0;
+  }
+  .geetest_panel_success {
+    display: none;
+    margin-top: 16px;
+    font-size: 20px;
+    font-weight: bold;
+    color: #16a34a;
+  }
+  .geetest_panel_error {
+    display: none;
+    margin-top: 16px;
+    font-size: 16px;
+    color: #dc2626;
+  }
+</style>
+</head>
+<body>
+<div class="geetest_widget">
+  <button class="geetest_radar_btn" id="radar">点击按钮进行验证</button>
+
+  <div class="geetest_panel" id="panel">
+    <div class="geetest_tips">请依次点击图中所有的圆形</div>
+    <div class="geetest_fullpage_click" id="clickArea">
+      <svg id="board" width="400" height="260" xmlns="http://www.w3.org/2000/svg">
+        <!-- 目标：3 个红色圆形 -->
+        <circle class="target-circle" cx="80"  cy="70"  r="30" fill="#e74c3c" stroke="#c0392b" stroke-width="2"/>
+        <circle class="target-circle" cx="200" cy="175" r="30" fill="#e74c3c" stroke="#c0392b" stroke-width="2"/>
+        <circle class="target-circle" cx="320" cy="70"  r="30" fill="#e74c3c" stroke="#c0392b" stroke-width="2"/>
+        <!-- 干扰项：2 个蓝色正方形 + 1 个绿色三角形 -->
+        <rect class="target-distractor" x="52"  y="152" width="55" height="55" fill="#3498db"/>
+        <rect class="target-distractor" x="292" y="152" width="55" height="55" fill="#3498db"/>
+        <polygon class="target-distractor" points="200,28 242,80 158,80" fill="#2ecc71"/>
+      </svg>
+    </div>
+  </div>
+
+  <div class="geetest_panel_success" id="success">验证通过</div>
+  <div class="geetest_panel_error" id="error">验证失败，请重试</div>
+</div>
+
+<script>
+  const radar = document.getElementById('radar');
+  const panel = document.getElementById('panel');
+  const board = document.getElementById('board');
+  const success = document.getElementById('success');
+  const error = document.getElementById('error');
+  const circles = Array.from(document.querySelectorAll('.target-circle'));
+  let clicked = 0;
+
+  radar.addEventListener('click', () => {
+    radar.style.display = 'none';
+    panel.style.display = 'block';
+    success.style.display = 'none';
+    error.style.display = 'none';
+    clicked = 0;
+    circles.forEach(c => c.setAttribute('fill', '#e74c3c'));
+  });
+
+  board.addEventListener('click', (e) => {
+    const el = e.target;
+    if (el.classList && el.classList.contains('target-circle')) {
+      if (el.getAttribute('fill') === '#c0392b') return; // 已点过
+      el.setAttribute('fill', '#c0392b');
+      clicked++;
+      if (clicked === circles.length) {
+        success.style.display = 'block';
+        panel.style.display = 'none';
+        radar.style.display = 'inline-block';
+        radar.textContent = '验证通过';
+      }
+    } else if (el.classList && el.classList.contains('target-distractor')) {
+      error.style.display = 'block';
+      clicked = 0;
+      circles.forEach(c => c.setAttribute('fill', '#e74c3c'));
+    }
+  });
+</script>
+</body>
+</html>

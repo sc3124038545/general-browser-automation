@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import random
 import re
 import subprocess
 import time
@@ -44,6 +45,9 @@ _BROWSER_DESCRIPTION = """\
 * wait: 等待秒数
 * go_back: 返回上一页
 * extract_content: 提取页面内容
+* scroll_and_collect: 滚动加载并收集列表数据（无限滚动到底后抽取商品标题/价格/店铺）
+* solve_slider_captcha: 求解滑块验证码（极验缺口拼图 OpenCV 定位 / 易盾拖到最右，失败自动刷新重试）
+* solve_click_captcha: 求解点选验证码（视觉识别多个点选目标并依次点击，失败自动重试）
 
 ## 工作原理
 click 和 type 内部自动选择最佳策略：
@@ -53,6 +57,174 @@ click 和 type 内部自动选择最佳策略：
 """
 
 Context = TypeVar("Context")
+
+
+def _to_int_coord(value):
+    """标准化视觉模型返回的坐标值：解包单元素数组并转为 int。"""
+    if isinstance(value, list) and len(value) >= 1:
+        value = value[0]
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _normalize_point(pt):
+    """
+    标准化单个点选坐标：支持 [x, y] 列表或 {"x":.., "y":..} 字典，返回 (x, y) 或 (None, None)。
+    """
+    if isinstance(pt, dict):
+        return _to_int_coord(pt.get("x")), _to_int_coord(pt.get("y"))
+    if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+        return _to_int_coord(pt[0]), _to_int_coord(pt[1])
+    return None, None
+
+
+def _detect_slide_gap(bg_bytes: bytes, fullbg_bytes: bytes) -> Optional[float]:
+    """
+    用 OpenCV 差值法定位缺口（阴影凹槽）中心的 x 偏移。
+
+    原理：Geetest 滑块验证码提供两张背景图 —— 含缺口的 bg 与不含缺口的 fullbg。
+    两者在缺口处有差异：bg 在缺口处用半透明黑色覆盖（更暗），其余区域完全一致。
+    把两者转灰度相减（fullbg - bg），缺口处差值为正，按列取均值后取显著为正的列段，
+    其中心即缺口中心。
+
+    返回中心而非左边缘：缺口与拼图块都带对称的投影阴影，中心对齐可抵消左右阴影
+    与软边的影响，比左边缘对齐更稳。
+
+    Args:
+        bg_bytes: 背景图（含缺口）的图片字节（PNG/JPEG）
+        fullbg_bytes: 完整背景图（不含缺口）的图片字节（PNG/JPEG）
+
+    Returns:
+        缺口中心在背景图中的 x 偏移（背景图像素），失败返回 None
+    """
+    import cv2
+    import numpy as np
+
+    def _decode(data: bytes):
+        arr = np.frombuffer(data, np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    bg = _decode(bg_bytes)
+    fullbg = _decode(fullbg_bytes)
+    if bg is None or fullbg is None:
+        return None
+
+    g_bg = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    g_full = cv2.cvtColor(fullbg, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    # 缺口处 bg 更暗 → fullbg - bg > 0
+    diff = g_full - g_bg
+    h, w = diff.shape
+
+    # 只取中间水平带（缺口通常垂直居中，避开上下边框/渐变干扰）
+    band = diff[int(h * 0.15): int(h * 0.85), :]
+    col = band.mean(axis=0)
+    if col.max() <= 0:
+        return None
+
+    # 缺口 = 差值显著为正的列段，取最长连续段中心（排除边缘/杂散差值干扰）
+    threshold = max(6.0, col.max() * 0.3)
+    mask = col > threshold
+    if not mask.any():
+        return None
+
+    best_start = best_len = 0
+    cur_start = cur_len = 0
+    for i, on in enumerate(mask):
+        if on:
+            if cur_len == 0:
+                cur_start = i
+            cur_len += 1
+        else:
+            if cur_len > best_len:
+                best_len, best_start = cur_len, cur_start
+            cur_len = 0
+    if cur_len > best_len:
+        best_len, best_start = cur_len, cur_start
+
+    return float(best_start) + float(best_len) / 2.0
+
+
+def _detect_piece_center(piece_bytes: bytes) -> Optional[float]:
+    """
+    用 OpenCV 在滑块小图（拼图块）中定位拼图块轮廓中心的 x 偏移。
+
+    拼图块 canvas 通常是透明背景，拼图块实体区域有 alpha，两侧各带一层投影阴影。
+    取 alpha 明显不透明的像素 x 范围中心即拼图块中心（阴影对称，中心与实体中心一致）。
+
+    Args:
+        piece_bytes: 滑块小图（拼图块）的图片字节（PNG，带 alpha 通道）
+
+    Returns:
+        拼图块轮廓中心的 x 偏移（背景图像素），失败返回 None
+    """
+    import cv2
+    import numpy as np
+
+    arr = np.frombuffer(piece_bytes, np.uint8)
+    piece = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+    if piece is None or piece.ndim != 3 or piece.shape[2] != 4:
+        return None
+
+    alpha = piece[:, :, 3]
+    ys, xs = np.where(alpha > 10)
+    if len(xs) == 0:
+        return None
+
+    return float(xs.min() + xs.max()) / 2.0
+
+
+def _build_human_track(start_x: float, start_y: float, end_x: float, end_y: float) -> list:
+    """
+    生成一条拟人化的拖拽轨迹点序列。
+
+    真实人手滑动滑块时：起步由静止逐渐加速、中段速度随机起伏、临近目标减速，
+    全程伴随 y 方向的手抖漂移，末端常"滑过头再回正"。极验等行为检测会拦截
+    匀速、平滑、精准的机器轨迹，因此这里用"剩余距离的随机比例"作为步长
+    （天然前快后慢 + 节奏不固定），叠加随机游走的 y 漂移与末端过冲修正。
+
+    Args:
+        start_x, start_y: 轨迹起点（滑块按钮中心）
+        end_x, end_y: 轨迹终点（缺口目标中心）
+
+    Returns:
+        [(x, y), ...] 轨迹点序列
+    """
+    dx = end_x - start_x
+    dy = end_y - start_y
+    adx = abs(dx)
+
+    # 点数随距离伸缩并随机波动，避免固定节奏
+    n = max(45, int(adx / 2.2) + random.randint(6, 18))
+
+    points = []
+    x = float(start_x)
+    y_walk = 0.0  # y 方向随机游走累计值（手抖漂移）
+
+    for i in range(n):
+        remaining = end_x - x
+        if i < 2:
+            # 起步：小步，模拟从静止加速
+            step = dx * random.uniform(0.02, 0.05)
+        else:
+            # 步长 = 剩余距离的随机比例，随剩余距离缩小 → 前快后慢
+            step = remaining * random.uniform(0.10, 0.20)
+        x += step
+
+        # y：有衰减的随机游走（手抖漂移）+ 高频小幅抖动 + 沿目标方向的整体趋势
+        y_walk = (y_walk + random.uniform(-1.2, 1.2)) * 0.85
+        progress = 1.0 - abs(end_x - x) / max(adx, 1.0)
+        y = start_y + y_walk + random.uniform(-1.0, 1.0) + dy * progress
+
+        points.append((x, y))
+
+    # 末端过冲再回正：多走一点再退回目标，模拟"滑过头再修正"
+    overshoot = random.uniform(2.0, 4.0) if dx >= 0 else random.uniform(-4.0, -2.0)
+    points.append((end_x + overshoot, end_y + random.uniform(-1.0, 1.0)))
+    points.append((end_x, end_y))
+    return points
 
 
 class BrowserUseTool(BaseTool, Generic[Context]):
@@ -73,9 +245,14 @@ class BrowserUseTool(BaseTool, Generic[Context]):
                     "go_back",
                     "wait",
                     "extract_content",
+                    "scroll_and_collect",
+                    "get_dropdown_options",
+                    "select_dropdown_option",
                     "switch_tab",
                     "open_tab",
                     "close_tab",
+                    "solve_slider_captcha",
+                    "solve_click_captcha",
                 ],
                 "description": "要执行的浏览器操作。推荐使用 click（点击元素）和 type（输入文本）",
             },
@@ -109,7 +286,15 @@ class BrowserUseTool(BaseTool, Generic[Context]):
             },
             "goal": {
                 "type": "string",
-                "description": "用于 'extract_content' 操作的提取目标",
+                "description": "用于 'extract_content' 或 'scroll_and_collect' 操作的提取目标",
+            },
+            "max_scrolls": {
+                "type": "integer",
+                "description": "用于 'scroll_and_collect' 操作的最大滚动次数（默认 10）",
+            },
+            "option": {
+                "type": "string",
+                "description": "用于 'select_dropdown_option' 操作要选择的选项文本（如 '广东省'）",
             },
         },
         "required": ["action"],
@@ -123,9 +308,14 @@ class BrowserUseTool(BaseTool, Generic[Context]):
             "go_back": [],
             "wait": ["seconds"],
             "extract_content": ["goal"],
+            "scroll_and_collect": ["goal"],
+            "get_dropdown_options": ["element_description"],
+            "select_dropdown_option": ["element_description", "option"],
             "switch_tab": ["tab_id"],
             "open_tab": ["url"],
             "close_tab": [],
+            "solve_slider_captcha": [],
+            "solve_click_captcha": [],
         },
     }
 
@@ -411,6 +601,7 @@ class BrowserUseTool(BaseTool, Generic[Context]):
         index: Optional[int] = None,
         text: Optional[str] = None,
         scroll_amount: Optional[int] = None,
+        max_scrolls: Optional[int] = None,
         tab_id: Optional[int] = None,
         query: Optional[str] = None,
         goal: Optional[str] = None,
@@ -418,6 +609,7 @@ class BrowserUseTool(BaseTool, Generic[Context]):
         seconds: Optional[int] = None,
         vision_instruction: Optional[str] = None,
         element_description: Optional[str] = None,
+        option: Optional[str] = None,
         **kwargs,
     ) -> ToolResult:
         """
@@ -717,46 +909,6 @@ class BrowserUseTool(BaseTool, Generic[Context]):
                     await page.keyboard.press(keys)
                     return ToolResult(output=f"Sent keys: {keys}")
 
-                elif action == "get_dropdown_options":
-                    if index is None:
-                        return ToolResult(
-                            error="Index is required for 'get_dropdown_options' action"
-                        )
-                    element = await context.get_dom_element_by_index(index)
-                    if not element:
-                        return ToolResult(error=f"Element with index {index} not found")
-                    page = await context.get_current_page()
-                    options = await page.evaluate(
-                        """
-                        (xpath) => {
-                            const select = document.evaluate(xpath, document, null,
-                                XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-                            if (!select) return null;
-                            return Array.from(select.options).map(opt => ({
-                                text: opt.text,
-                                value: opt.value,
-                                index: opt.index
-                            }));
-                        }
-                    """,
-                        element.xpath,
-                    )
-                    return ToolResult(output=f"Dropdown options: {options}")
-
-                elif action == "select_dropdown_option":
-                    if index is None or not text:
-                        return ToolResult(
-                            error="Index and text are required for 'select_dropdown_option' action"
-                        )
-                    element = await context.get_dom_element_by_index(index)
-                    if not element:
-                        return ToolResult(error=f"Element with index {index} not found")
-                    page = await context.get_current_page()
-                    await page.select_option(element.xpath, label=text)
-                    return ToolResult(
-                        output=f"Selected option '{text}' from dropdown at index {index}"
-                    )
-
                 # 内容提取操作
                 elif action == "extract_content":
                     if not goal:
@@ -829,6 +981,18 @@ Page content:
 
                     return ToolResult(output="No content was extracted from the page.")
 
+                # 滚动加载并收集列表数据（电商比价场景）
+                elif action == "scroll_and_collect":
+                    if not goal:
+                        return ToolResult(
+                            error="Goal is required for 'scroll_and_collect' action"
+                        )
+                    return await self._scroll_and_collect(
+                        context,
+                        goal,
+                        max_scrolls if max_scrolls is not None else 10,
+                    )
+
                 # 标签页管理操作
                 elif action == "switch_tab":
                     if tab_id is None:
@@ -875,6 +1039,34 @@ Page content:
                             error="text is required for 'type' action"
                         )
                     return await self._type(context, element_description, text)
+
+                # 获取原生 <select> 下拉框的可选列表（级联表单「先看后选」的查看步骤）
+                elif action == "get_dropdown_options":
+                    if not element_description:
+                        return ToolResult(
+                            error="element_description is required for 'get_dropdown_options' action"
+                        )
+                    return await self._get_dropdown_options(context, element_description)
+
+                # 选择原生 <select> 下拉框的某个选项（自动触发 change 事件驱动级联刷新）
+                elif action == "select_dropdown_option":
+                    if not element_description:
+                        return ToolResult(
+                            error="element_description is required for 'select_dropdown_option' action"
+                        )
+                    if not option:
+                        return ToolResult(
+                            error="option is required for 'select_dropdown_option' action"
+                        )
+                    return await self._select_dropdown_option(context, element_description, option)
+
+                # 滑块验证码求解：视觉识别缺口 → 人类化拖拽 → 验证 → 失败刷新重试
+                elif action == "solve_slider_captcha":
+                    return await self._solve_slider_captcha(context)
+
+                # 点选验证码求解：视觉识别多个点选目标 → 依次点击 → 验证 → 失败刷新重试
+                elif action == "solve_click_captcha":
+                    return await self._solve_click_captcha(context)
 
                 else:
                     return ToolResult(error=f"Unknown action: {action}")
@@ -929,6 +1121,14 @@ Page content:
                 f.write(screenshot_bytes)
             logger.info(f"[GUI-Plus] Screenshot saved: {screenshot_path}")
 
+            # 视觉模型将坐标归一化到 0-1000（Qwen-VL 约定），需换算回视口 CSS 像素。
+            # 截图即视口（full_page=False），DPR 在换算中约掉，除以 1000 再乘回视口尺寸即可。
+            viewport_size = await page.evaluate(
+                "() => ({w: window.innerWidth, h: window.innerHeight})"
+            )
+            scale_x = viewport_size["w"] / 1000.0
+            scale_y = viewport_size["h"] / 1000.0
+
             # 2. 构建 GUI-Plus 的 system prompt
             gui_plus_system_prompt = """## 1. 核心角色 (Core Role)
 你是一个顶级的AI视觉操作代理。你的任务是分析电脑屏幕截图，理解用户的指令，然后将任务分解为单一、精确的GUI原子操作。
@@ -942,7 +1142,7 @@ Page content:
 ## 3. [CRITICAL] JSON Schema & 绝对规则
 你的输出**必须**是一个严格符合以下规则的JSON对象。**任何偏差都将导致失败**。
 - **[R1] 严格的JSON**: 你的回复**必须**是且**只能是**一个JSON对象。禁止在JSON代码块前后添加任何文本、注释或解释。
-- **[R2] 精确的Action值**: `action`字段的值**必须**是下列之一：`CLICK`, `TYPE`, `SCROLL`, `KEY_PRESS`, `FINISH`, `FAIL`。
+- **[R2] 精确的Action值**: `action`字段的值**必须**是下列之一：`CLICK`, `TYPE`, `SCROLL`, `KEY_PRESS`, `DRAG`, `CLICK_POINTS`, `FINISH`, `FAIL`。
 - **[R3] 严格的Parameters结构**: `parameters`对象的结构**必须**与所选Action定义的模板**完全一致**。
 
 ## 4. 工具集 (Available Actions)
@@ -951,6 +1151,12 @@ Page content:
 - **功能**: 单击屏幕上的元素。
 - **Parameters模板**:
 {"x": <integer>, "y": <integer>, "description": "<string: 描述你点击的是什么>"}
+
+### CLICK_POINTS
+- **功能**: 依次点击图中的多个目标（用于点选验证码，如"依次点击图中所有XX"）。
+- **重要**: points 是按点击顺序排列的坐标列表，每一项都是目标中心坐标 [x, y]。
+- **Parameters模板**:
+{"points": [[<int x1>, <int y1>], [<int x2>, <int y2>], ...], "description": "<string: 描述点选的目标>"}
 
 ### TYPE
 - **功能**: 先点击输入框，然后输入文本。必须提供输入框中心的坐标。
@@ -967,6 +1173,12 @@ Page content:
 - **功能**: 按下功能键。
 - **Parameters模板**:
 {"key": "<string: e.g., 'enter', 'esc', 'alt+f4'>"}
+
+### DRAG
+- **功能**: 拖拽滑块从起点滑到终点（用于滑块验证码）。
+- **重要**: start_x/start_y 是滑块按钮的中心坐标，end_x/end_y 是缺口目标的中心坐标。
+- **Parameters模板**:
+{"start_x": <integer>, "start_y": <integer>, "end_x": <integer>, "end_y": <integer>, "description": "<string: 描述拖拽的滑块>"}
 
 ### FINISH
 - **功能**: 任务成功完成。
@@ -1021,90 +1233,113 @@ Page content:
             logger.info(f"[GUI-Plus] Model response: {response_content}")
 
             # 4. 解析 JSON 响应
-            # 视觉模型返回的 JSON 格式经常不规范，需要多层预处理修复
-            # 已知不规范模式：
-            #   (a) "points": [190, 258] — 用 points 键名代替 x/y
-            #   (b) "x": [139, 675] — x 被写成数组
-            #   (c) "y": [413] — y 被写成单元素数组
-            #   (d) "x": 342, 807] — 缺少 "y": 键名，且用 ] 闭合对象
-            #   (e) 残留的 ] 在数字后 — 模型误将 } 写成 ]
+            # 先直接解析原始响应：模型大多数时候返回合法 JSON（含嵌套 points 数组），
+            # 过早套用下面的扁平坐标修复正则反而会破坏嵌套结构（如 CLICK_POINTS 的 [[x,y],...]）。
+            raw_json_match = re.search(r'\{[\s\S]*\}', response_content)
+            result = None
+            if raw_json_match:
+                try:
+                    result = json.loads(raw_json_match.group())
+                except json.JSONDecodeError:
+                    result = None
 
-            fixed_response = response_content
+            if result is None:
+                # 原始响应不是合法 JSON，逐层预处理修复。
+                # 已知不规范模式：
+                #   (a) "points": [190, 258] — 用 points 键名代替 x/y
+                #   (b) "x": [139, 675] — x 被写成数组
+                #   (c) "y": [413] — y 被写成单元素数组
+                #   (d) "x": 342, 807] — 缺少 "y": 键名，且用 ] 闭合对象
+                #   (e) 残留的 ] 在数字后 — 模型误将 } 写成 ]
 
-            # (a) "points": [x, y] → "x": x, "y": y（必须在其他修复之前，因为这是合法的 []）
-            fixed_response = re.sub(
-                r'"points":\s*\[(\d+),\s*(\d+)\]',
-                r'"x": \1, "y": \2',
-                fixed_response
-            )
-            # (b) "x": [N, M] → "x": N, "y": M
-            fixed_response = re.sub(
-                r'"x":\s*\[(\d+),\s*(\d+)\]',
-                r'"x": \1, "y": \2',
-                fixed_response
-            )
-            # (c) "y": [N] → "y": N
-            fixed_response = re.sub(
-                r'"y":\s*\[(\d+)\]',
-                r'"y": \1',
-                fixed_response
-            )
-            # (d) "x": N, M 后跟 , 或 } 或 ] → "x": N, "y": M（保留原始终止符）
-            fixed_response = re.sub(
-                r'"x":\s*(\d+),\s*(\d+)\s*([,}\]])',
-                lambda m: f'"x": {m.group(1)}, "y": {m.group(2)}{m.group(3)}',
-                fixed_response
-            )
-            # (e) 修复数字后跟 ] 的模式（] 通常是模型幻觉多写的字符）
-            # 情况1: ] 后跟逗号 → 去掉 ]，JSON 对象还需继续
-            fixed_response = re.sub(r'(\d+)\]\s*,', r'\1,', fixed_response)
-            # 情况2: ] 后跟 } → 去掉 ]（] 是多余的）
-            fixed_response = re.sub(r'(\d+)\]\s*}', r'\1}', fixed_response)
-            # 情况3: ] 在字符串末尾 → 替换为 }（闭合整个 JSON 对象）
-            fixed_response = re.sub(r'(\d+)\]\s*$', r'\1}', fixed_response)
+                fixed_response = response_content
 
-            if fixed_response != response_content:
-                logger.warning(f"[GUI-Plus] Fixed JSON format: {fixed_response[:200]}")
+                # (a) "points": [x, y] → "x": x, "y": y（必须在其他修复之前，因为这是合法的 []）
+                fixed_response = re.sub(
+                    r'"points":\s*\[(\d+),\s*(\d+)\]',
+                    r'"x": \1, "y": \2',
+                    fixed_response
+                )
+                # (b) "x": [N, M] → "x": N, "y": M
+                fixed_response = re.sub(
+                    r'"x":\s*\[(\d+),\s*(\d+)\]',
+                    r'"x": \1, "y": \2',
+                    fixed_response
+                )
+                # (c) "y": [N] → "y": N
+                fixed_response = re.sub(
+                    r'"y":\s*\[(\d+)\]',
+                    r'"y": \1',
+                    fixed_response
+                )
+                # (d) "x": N, M 后跟 , 或 } 或 ] → "x": N, "y": M（保留原始终止符）
+                fixed_response = re.sub(
+                    r'"x":\s*(\d+),\s*(\d+)\s*([,}\]])',
+                    lambda m: f'"x": {m.group(1)}, "y": {m.group(2)}{m.group(3)}',
+                    fixed_response
+                )
+                # (d2) "start_x": N, M → "start_x": N, "start_y": M（DRAG 起点，模型把 x/y 写成 start_x 后的裸数字）
+                fixed_response = re.sub(
+                    r'"start_x":\s*(\d+),\s*(\d+)\s*([,}\]])',
+                    lambda m: f'"start_x": {m.group(1)}, "start_y": {m.group(2)}{m.group(3)}',
+                    fixed_response
+                )
+                # (d3) "end_x": N, M → "end_x": N, "end_y": M（DRAG 终点）
+                fixed_response = re.sub(
+                    r'"end_x":\s*(\d+),\s*(\d+)\s*([,}\]])',
+                    lambda m: f'"end_x": {m.group(1)}, "end_y": {m.group(2)}{m.group(3)}',
+                    fixed_response
+                )
+                # (e) 修复数字后跟 ] 的模式（] 通常是模型幻觉多写的字符）
+                # 情况1: ] 后跟逗号 → 去掉 ]，JSON 对象还需继续
+                fixed_response = re.sub(r'(\d+)\]\s*,', r'\1,', fixed_response)
+                # 情况2: ] 后跟 } → 去掉 ]（] 是多余的）
+                fixed_response = re.sub(r'(\d+)\]\s*}', r'\1}', fixed_response)
+                # 情况3: ] 在字符串末尾 → 替换为 }（闭合整个 JSON 对象）
+                fixed_response = re.sub(r'(\d+)\]\s*$', r'\1}', fixed_response)
 
-            # 尝试提取 JSON（处理可能的 markdown 代码块和不完整的 JSON）
-            json_match = re.search(r'\{[\s\S]*\}', fixed_response)
-            if not json_match:
-                # 尝试修复不完整的 JSON（添加缺失的 }）
-                incomplete_match = re.search(r'\{[\s\S]*', fixed_response)
-                if incomplete_match:
-                    incomplete_json = incomplete_match.group()
-                    # 计算缺失的闭合括号数量
-                    open_braces = incomplete_json.count('{')
-                    close_braces = incomplete_json.count('}')
-                    missing_braces = open_braces - close_braces
-                    if missing_braces > 0:
-                        fixed_json = incomplete_json + '}' * missing_braces
-                        try:
-                            result = json.loads(fixed_json)
-                            logger.warning(f"[GUI-Plus] Fixed incomplete JSON response")
-                        except json.JSONDecodeError:
+                if fixed_response != response_content:
+                    logger.warning(f"[GUI-Plus] Fixed JSON format: {fixed_response[:200]}")
+
+                # 尝试提取 JSON（处理可能的 markdown 代码块和不完整的 JSON）
+                json_match = re.search(r'\{[\s\S]*\}', fixed_response)
+                if not json_match:
+                    # 尝试修复不完整的 JSON（添加缺失的 }）
+                    incomplete_match = re.search(r'\{[\s\S]*', fixed_response)
+                    if incomplete_match:
+                        incomplete_json = incomplete_match.group()
+                        # 计算缺失的闭合括号数量
+                        open_braces = incomplete_json.count('{')
+                        close_braces = incomplete_json.count('}')
+                        missing_braces = open_braces - close_braces
+                        if missing_braces > 0:
+                            fixed_json = incomplete_json + '}' * missing_braces
+                            try:
+                                result = json.loads(fixed_json)
+                                logger.warning(f"[GUI-Plus] Fixed incomplete JSON response")
+                            except json.JSONDecodeError:
+                                return ToolResult(error=f"无法从模型响应中解析 JSON: {fixed_response}")
+                        else:
                             return ToolResult(error=f"无法从模型响应中解析 JSON: {fixed_response}")
                     else:
                         return ToolResult(error=f"无法从模型响应中解析 JSON: {fixed_response}")
                 else:
-                    return ToolResult(error=f"无法从模型响应中解析 JSON: {fixed_response}")
-            else:
-                try:
-                    result = json.loads(json_match.group())
-                except json.JSONDecodeError as e:
-                    # 尝试修复不完整的 JSON
-                    json_str = json_match.group()
-                    open_braces = json_str.count('{')
-                    close_braces = json_str.count('}')
-                    if open_braces > close_braces:
-                        fixed_json = json_str + '}' * (open_braces - close_braces)
-                        try:
-                            result = json.loads(fixed_json)
-                            logger.warning(f"[GUI-Plus] Fixed incomplete JSON response")
-                        except json.JSONDecodeError:
+                    try:
+                        result = json.loads(json_match.group())
+                    except json.JSONDecodeError as e:
+                        # 尝试修复不完整的 JSON
+                        json_str = json_match.group()
+                        open_braces = json_str.count('{')
+                        close_braces = json_str.count('}')
+                        if open_braces > close_braces:
+                            fixed_json = json_str + '}' * (open_braces - close_braces)
+                            try:
+                                result = json.loads(fixed_json)
+                                logger.warning(f"[GUI-Plus] Fixed incomplete JSON response")
+                            except json.JSONDecodeError:
+                                return ToolResult(error=f"JSON 解析失败: {e}, 原始响应: {fixed_response}")
+                        else:
                             return ToolResult(error=f"JSON 解析失败: {e}, 原始响应: {fixed_response}")
-                    else:
-                        return ToolResult(error=f"JSON 解析失败: {e}, 原始响应: {fixed_response}")
 
             # 修复 GUI-Plus 不规范的响应格式
             action_type = result.get("action", "").strip().upper()
@@ -1117,7 +1352,12 @@ Page content:
             if isinstance(params, dict):
                 if params.get("x") is None and params.get("y") is None:
                     pts = params.get("points") or result.get("points")
-                    if pts and isinstance(pts, list) and len(pts) >= 2:
+                    # 仅当 points 是扁平 [x, y] 时才转成 x/y；嵌套 [[x,y],...] 是 CLICK_POINTS 的多点坐标，跳过
+                    if (
+                        pts and isinstance(pts, list) and len(pts) >= 2
+                        and not isinstance(pts[0], (list, dict))
+                        and not isinstance(pts[1], (list, dict))
+                    ):
                         params["x"], params["y"] = pts[0], pts[1]
                         logger.warning(f"[GUI-Plus] Converted 'points' [{pts[0]}, {pts[1]}] to x/y")
                 if params.get("x") is None and params.get("y") is None:
@@ -1169,6 +1409,8 @@ Page content:
                             y = int(y)
                         except (ValueError, TypeError):
                             pass
+                        x = int(round(x * scale_x))
+                        y = int(round(y * scale_y))
                         logger.info(f"[GUI-Plus] Click+Type: ({x}, {y}) then type '{text_to_type}'")
                         await page.mouse.click(x, y)
                         await asyncio.sleep(0.3)
@@ -1209,6 +1451,10 @@ Page content:
                     y = int(y)
                 except (ValueError, TypeError):
                     return ToolResult(error=f"CLICK 坐标格式错误: x={x}, y={y}")
+
+                # 视觉模型坐标归一化到 0-1000，换算回视口 CSS 像素
+                x = int(round(x * scale_x))
+                y = int(round(y * scale_y))
 
                 logger.info(f"[GUI-Plus] CLICK at ({x}, {y}): {description}")
 
@@ -1260,6 +1506,10 @@ Page content:
                         y = int(y)
                     except (ValueError, TypeError):
                         return ToolResult(error=f"TYPE 坐标格式错误: x={x}, y={y}")
+
+                    # 视觉模型坐标归一化到 0-1000，换算回视口 CSS 像素
+                    x = int(round(x * scale_x))
+                    y = int(round(y * scale_y))
 
                     logger.info(f"[GUI-Plus] TYPE: click ({x}, {y}) then type '{text_to_type}'")
 
@@ -1316,6 +1566,69 @@ Page content:
                     return ToolResult(output=f"[vision] 成功按下按键: {key}")
                 return ToolResult(error="KEY_PRESS 操作缺少按键")
 
+            elif action_type == "DRAG":
+                # 标准化键名：视觉模型可能用 x/y 表示起点，target/to 表示终点
+                start_x = params.get("start_x", params.get("x", params.get("from_x")))
+                start_y = params.get("start_y", params.get("y", params.get("from_y")))
+                end_x = params.get("end_x", params.get("target_x", params.get("to_x")))
+                end_y = params.get("end_y", params.get("target_y", params.get("to_y")))
+
+                start_x = _to_int_coord(start_x)
+                start_y = _to_int_coord(start_y)
+                end_x = _to_int_coord(end_x)
+                end_y = _to_int_coord(end_y)
+
+                if start_x is None or start_y is None or end_x is None or end_y is None:
+                    return ToolResult(error=f"DRAG 操作缺少坐标: {params}")
+
+                # 视觉模型坐标归一化到 0-1000，换算回视口 CSS 像素
+                start_x = int(round(start_x * scale_x))
+                start_y = int(round(start_y * scale_y))
+                end_x = int(round(end_x * scale_x))
+                end_y = int(round(end_y * scale_y))
+
+                description = params.get("description", "滑块")
+                logger.info(
+                    f"[GUI-Plus] DRAG: ({start_x}, {start_y}) -> ({end_x}, {end_y}): {description}"
+                )
+
+                await self._human_like_drag(page, start_x, start_y, end_x, end_y)
+                await asyncio.sleep(0.5)
+
+                return ToolResult(
+                    output=f"[vision] 成功拖拽 ({start_x}, {start_y}) -> ({end_x}, {end_y}): {description}\n思考过程: {thought}"
+                )
+
+            elif action_type == "CLICK_POINTS":
+                # 点选验证码：一次识别多个目标，按顺序依次点击
+                # 模型可能把 points 放在 parameters 里，也可能直接放在根级别
+                points = params.get("points") if isinstance(params, dict) else None
+                if points is None:
+                    points = result.get("points")
+                if not isinstance(points, list) or len(points) == 0:
+                    return ToolResult(error=f"CLICK_POINTS 操作缺少 points: {params}")
+
+                clicked = []
+                for idx, pt in enumerate(points, 1):
+                    x, y = _normalize_point(pt)
+                    if x is None or y is None:
+                        logger.warning(f"[GUI-Plus] CLICK_POINTS 第 {idx} 个点格式非法: {pt}")
+                        continue
+                    # 视觉模型坐标归一化到 0-1000，换算回视口 CSS 像素
+                    x = int(round(x * scale_x))
+                    y = int(round(y * scale_y))
+                    await page.mouse.click(x, y)
+                    # 点选之间随机间隔，模拟真人判断节奏
+                    await asyncio.sleep(random.uniform(0.3, 0.6))
+                    clicked.append((x, y))
+                    logger.info(f"[GUI-Plus] CLICK_POINTS 第 {idx}/{len(points)} 个点 ({x}, {y})")
+
+                if not clicked:
+                    return ToolResult(error=f"CLICK_POINTS 未能解析任何有效坐标: {points}")
+                return ToolResult(
+                    output=f"[vision] 依次点击 {len(clicked)} 个点: {clicked}\n思考过程: {thought}"
+                )
+
             elif action_type == "FINISH":
                 message = params.get("message", "任务完成")
                 return ToolResult(output=f"[vision] 任务完成: {message}")
@@ -1344,6 +1657,415 @@ Page content:
                     error=f"[vision] 当前模型不支持视觉工具调用，请降级使用 JavaScript 方式定位元素"
                 )
             return ToolResult(error=f"[vision] 执行失败: {str(e)}")
+
+    async def _human_like_drag(
+        self, page, start_x: int, start_y: int, end_x: int, end_y: int
+    ) -> None:
+        """
+        人类化拖拽轨迹：先快后慢 + 抖动，模拟真人滑动滑块，降低被机器轨迹识别拦截的概率。
+
+        Args:
+            page: Playwright page 对象
+            start_x, start_y: 滑块按钮中心坐标
+            end_x, end_y: 缺口目标中心坐标
+        """
+        # 生成拟人轨迹：起步慢、中段快、末端减速 + 手抖漂移 + 末端过冲修正
+        track = _build_human_track(float(start_x), float(start_y), float(end_x), float(end_y))
+
+        # 移动到滑块起点并短暂停留，模拟人先对准目标
+        await page.mouse.move(start_x, start_y)
+        await asyncio.sleep(random.uniform(0.12, 0.3))
+
+        # 按下鼠标，稍作停顿模拟人手准备
+        await page.mouse.down()
+        await asyncio.sleep(random.uniform(0.05, 0.14))
+
+        pause_every = random.randint(8, 14)
+        for i, (x, y) in enumerate(track):
+            await page.mouse.move(x, y)
+            # 每步间隔随机；中段偶发短暂停顿模拟犹豫
+            delay = random.uniform(0.006, 0.018)
+            if i > 3 and i % pause_every == 0:
+                delay += random.uniform(0.04, 0.1)
+            await asyncio.sleep(delay)
+
+        await asyncio.sleep(random.uniform(0.05, 0.12))
+        await page.mouse.up()
+
+    async def _verify_captcha_passed(self, page) -> bool:
+        """
+        检查滑块验证码是否已通过。
+
+        极验：成功面板（.geetest_panel_success）展开可见，或雷达按钮文案变为"验证成功/通过"。
+        易盾：滑块按钮停在轨道最右且出现"成功/通过"文案（被拒则回弹并报"出错"）。
+        这里轮询 DOM 判定，比截图 + 视觉模型更快更稳。
+        """
+        for _ in range(8):
+            passed = await page.evaluate(
+                """
+                () => {
+                    const ok = document.querySelector('.geetest_panel_success');
+                    if (ok && ok.getBoundingClientRect().height > 0) return true;
+                    const radar = document.querySelector('.geetest_radar_btn');
+                    if (radar && /成功|通过|success/i.test(radar.innerText || '')) return true;
+                    const scale = document.querySelector('.nc_scale');
+                    const btn = document.querySelector('.btn_slide');
+                    if (scale && btn) {
+                        const sr = scale.getBoundingClientRect();
+                        const br = btn.getBoundingClientRect();
+                        const atRight = sr.width > 10 && (br.x + br.width) >= (sr.x + sr.width - 4);
+                        const txt = (document.querySelector('.nc-lang-cnt') || {}).innerText || '';
+                        if (atRight && /成功|通过|success/i.test(txt)) return true;
+                    }
+                    return false;
+                }
+                """
+            )
+            if passed:
+                return True
+            await asyncio.sleep(0.5)
+        return False
+
+    async def _extract_slide_captcha(self, page) -> Optional[dict]:
+        """
+        从页面 DOM 提取滑块验证码元素，返回带 kind 区分的结果。
+
+        kind="geetest"：极验 canvas 拼图（.geetest_canvas_bg / .geetest_canvas_slice /
+        .geetest_slider_button），返回 bg/piece/fullbg 图片字节 + 几何信息，供 OpenCV 定位缺口。
+        kind="yidun"：网易易盾「拖到最右」滑块（.nc_scale / .btn_slide），无缺口拼图，
+        返回 scale_rect/btn_rect，拖拽距离 = 轨道宽 - 按钮宽。
+
+        Returns:
+            含 kind 字段的 dict；找不到任何滑块元素时返回 None
+        """
+        import base64 as _b64
+
+        def _dataurl_to_bytes(url: str) -> bytes:
+            return _b64.b64decode(url.split(",", 1)[1])
+
+        # 1. 极验 canvas 拼图（含缺口）
+        geetest_js = """
+        () => {
+            const bg = document.querySelector('.geetest_canvas_bg');
+            const slice = document.querySelector('.geetest_canvas_slice');
+            const fullbg = document.querySelector('.geetest_canvas_fullbg');
+            const btn = document.querySelector('.geetest_slider_button');
+            if (!bg || !slice || !btn) return null;
+            const bgRect = bg.getBoundingClientRect();
+            const btnRect = btn.getBoundingClientRect();
+            if (bgRect.width < 10 || btnRect.width < 10) return null;
+            return {
+                bg: bg.toDataURL('image/png'),
+                piece: slice.toDataURL('image/png'),
+                fullbg: fullbg ? fullbg.toDataURL('image/png') : null,
+                bg_native_w: bg.width,
+                bg_rect: {x: bgRect.x, y: bgRect.y, w: bgRect.width, h: bgRect.height},
+                slider_center: {x: btnRect.x + btnRect.width / 2, y: btnRect.y + btnRect.height / 2},
+            };
+        }
+        """
+        data = await page.evaluate(geetest_js)
+        if data:
+            data["bg"] = _dataurl_to_bytes(data["bg"])
+            data["piece"] = _dataurl_to_bytes(data["piece"])
+            if data.get("fullbg"):
+                data["fullbg"] = _dataurl_to_bytes(data["fullbg"])
+            data["kind"] = "geetest"
+            return data
+
+        # 2. 网易易盾「拖到最右」滑块（无缺口拼图）
+        yidun_js = """
+        () => {
+            const scale = document.querySelector('.nc_scale');
+            const btn = document.querySelector('.btn_slide');
+            if (!scale || !btn) return null;
+            const sr = scale.getBoundingClientRect();
+            const br = btn.getBoundingClientRect();
+            if (sr.width < 10 || br.width < 10) return null;
+            return {
+                scale_rect: {x: sr.x, y: sr.y, w: sr.width, h: sr.height},
+                btn_rect: {x: br.x, y: br.y, w: br.width, h: br.height},
+            };
+        }
+        """
+        data = await page.evaluate(yidun_js)
+        if data:
+            data["kind"] = "yidun"
+            return data
+
+        return None
+
+    async def _refresh_captcha(self, page) -> None:
+        """重新触发拼图用于重试（点击刷新按钮重新出题，而非整页刷新丢失验证码状态）。"""
+        try:
+            await page.evaluate(
+                """
+                () => {
+                    const radar = document.querySelector('.geetest_radar_btn');
+                    if (radar) { radar.click(); return; }
+                    // 易盾失败后出现"点击刷新"入口
+                    const els = Array.from(document.querySelectorAll('a, span, div, i, button'));
+                    const refresh = els.find(e => /点击刷新|刷新/.test((e.innerText || '').trim()));
+                    if (refresh) refresh.click();
+                }
+                """
+            )
+            for _ in range(16):
+                if await page.evaluate(
+                    """
+                    () => {
+                        // 滑块验证码：背景画布 / 易盾轨道出现；点选验证码：大图点击区域可见
+                        if (document.querySelector('.geetest_canvas_bg')) return true;
+                        if (document.querySelector('.nc_scale')) return true;
+                        const click = document.querySelector('.geetest_fullpage_click');
+                        return !!click && click.getBoundingClientRect().height > 0;
+                    }
+                    """
+                ):
+                    return
+                await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.debug(f"[captcha] 刷新失败: {e}")
+
+    async def _solve_slider_captcha(
+        self, context: BrowserContext, max_attempts: int = 3
+    ) -> ToolResult:
+        """
+        滑块验证码求解：DOM 提取滑块 → 计算拖拽距离 → 人类化拖拽 → DOM 验证 → 失败刷新重试。
+
+        支持两类滑块：
+        - 极验（Geetest）canvas 拼图：OpenCV 差值法定位缺口中心，拖拽距离 = 缺口中心 - 拼图块中心；
+        - 网易易盾（Yidun）「拖到最右」：无缺口拼图，直接把滑块拖到轨道最右端。
+
+        Args:
+            context: 浏览器上下文
+            max_attempts: 最大尝试次数（失败后刷新重试）
+
+        Returns:
+            ToolResult
+        """
+        page = await context.get_current_page()
+        await page.bring_to_front()
+        await page.wait_for_load_state()
+
+        for attempt in range(1, max_attempts + 1):
+            logger.info(f"[captcha] 第 {attempt}/{max_attempts} 次尝试求解滑块验证码")
+
+            # 1. 从 DOM 提取滑块元素（极验拼图 / 易盾拖到最右）
+            slide = await self._extract_slide_captcha(page)
+            if not slide:
+                logger.warning(f"[captcha] 未找到滑块元素，刷新重试")
+                await self._refresh_captcha(page)
+                continue
+
+            # 2. 计算拖拽起止坐标：易盾直接拖到最右，极验用 OpenCV 定位缺口
+            if slide["kind"] == "yidun":
+                start_x = slide["btn_rect"]["x"] + slide["btn_rect"]["w"] / 2
+                start_y = slide["btn_rect"]["y"] + slide["btn_rect"]["h"] / 2
+                end_x = (
+                    slide["scale_rect"]["x"]
+                    + slide["scale_rect"]["w"]
+                    - slide["btn_rect"]["w"] / 2
+                )
+                end_y = start_y
+                logger.info(
+                    f"[captcha] 易盾滑块拖到最右：({start_x:.0f}, {start_y:.0f}) -> "
+                    f"({end_x:.0f}, {end_y:.0f})，距离 {end_x - start_x:.0f}px"
+                )
+            else:
+                if not slide.get("fullbg"):
+                    logger.warning(f"[captcha] 未获取完整背景图（fullbg），刷新重试")
+                    await self._refresh_captcha(page)
+                    continue
+                gap_center = _detect_slide_gap(slide["bg"], slide["fullbg"])
+                piece_center = _detect_piece_center(slide["piece"])
+                if gap_center is None or piece_center is None:
+                    logger.warning(f"[captcha] 缺口/拼图块检测失败，刷新重试")
+                    await self._refresh_captcha(page)
+                    continue
+                drag_native = gap_center - piece_center
+                start_x = slide["slider_center"]["x"]
+                start_y = slide["slider_center"]["y"]
+                scale = slide["bg_rect"]["w"] / slide["bg_native_w"]
+                end_x = start_x + drag_native * scale
+                end_y = start_y
+                logger.info(
+                    f"[captcha] 缺口中心 {gap_center:.1f}px，拼图块中心 {piece_center:.1f}px，"
+                    f"拖拽 {drag_native:.1f}px → ({start_x:.0f}, {start_y:.0f}) -> ({end_x:.0f}, {end_y:.0f})"
+                )
+
+            # 3. 人类化拖拽
+            await self._human_like_drag(
+                page, int(start_x), int(start_y), int(end_x), int(end_y)
+            )
+            await asyncio.sleep(1.0)
+
+            # 4. 检查验证码是否通过（DOM 判定）
+            if await self._verify_captcha_passed(page):
+                return ToolResult(
+                    output=f"[captcha] 滑块验证码已通过（第 {attempt} 次尝试）"
+                )
+
+            logger.warning(f"[captcha] 第 {attempt} 次未通过，重新触发重试")
+            await self._refresh_captcha(page)
+
+        return ToolResult(
+            error=f"[captcha] 尝试 {max_attempts} 次后仍未通过滑块验证码"
+        )
+
+    async def _solve_click_captcha(
+        self, context: BrowserContext, max_attempts: int = 3
+    ) -> ToolResult:
+        """
+        点选验证码求解：视觉模型读取题目并一次识别多个点选目标 → 依次点击 → DOM 验证 → 失败重试。
+
+        点选验证码（文字点选/图标点选）在大图上出一道题（如"请依次点击图中所有XX"），
+        需要按顺序点击多个目标。题目文案直接渲染在截图中，由视觉模型读取，无需单独解析 DOM。
+
+        Args:
+            context: 浏览器上下文
+            max_attempts: 最大尝试次数
+
+        Returns:
+            ToolResult
+        """
+        page = await context.get_current_page()
+        await page.bring_to_front()
+        await page.wait_for_load_state()
+
+        for attempt in range(1, max_attempts + 1):
+            logger.info(f"[captcha] 第 {attempt}/{max_attempts} 次尝试求解点选验证码")
+
+            # 题目渲染在截图中，视觉模型读取后返回 CLICK_POINTS 依次点击
+            instruction = (
+                "这是点选验证码。请仔细阅读截图中的题目要求，"
+                "然后使用 CLICK_POINTS 按题目要求的顺序依次点击图中所有符合要求的目标。"
+                "每个点选目标的坐标都取该目标图形的中心。"
+            )
+            result = await self._execute_vision_action(
+                context, instruction, action_hint="click_points"
+            )
+            if result.error:
+                logger.warning(f"[captcha] 视觉点选失败：{result.error}")
+                await self._refresh_captcha(page)
+                continue
+
+            await asyncio.sleep(1.5)
+
+            if await self._verify_captcha_passed(page):
+                return ToolResult(
+                    output=f"[captcha] 点选验证码已通过（第 {attempt} 次尝试）\n{result.output}"
+                )
+
+            logger.warning(f"[captcha] 第 {attempt} 次未通过，刷新重试")
+            await self._refresh_captcha(page)
+
+        return ToolResult(
+            error=f"[captcha] 尝试 {max_attempts} 次后仍未通过点选验证码"
+        )
+
+    async def _scroll_and_collect(
+        self, context: BrowserContext, goal: str, max_scrolls: int = 10
+    ) -> ToolResult:
+        """
+        滚动加载并收集列表数据（电商比价场景核心动作）。
+
+        无限滚动循环：滚动 → 等待 → 检测 scrollHeight 增量，连续两次无增长（已到底）
+        或达到 max_scrolls 上限即停；然后把当前完整 DOM 转 markdown 交给 LLM 抽取
+        结构化商品列表（标题/价格/店铺）。
+
+        Args:
+            context: 浏览器上下文
+            goal: 提取目标（如"商品标题、价格、店铺"）
+            max_scrolls: 最大滚动次数
+
+        Returns:
+            ToolResult（output 含结构化商品列表）
+        """
+        page = await context.get_current_page()
+        await page.wait_for_load_state()
+
+        step = context.config.browser_window_size["height"]
+
+        # 1. 无限滚动：滚动 → 等待 → 检测增量，到底或达到上限即停
+        last_height = 0
+        no_growth = 0
+        scrolled = 0
+        for _ in range(max_scrolls):
+            await context.execute_javascript(f"window.scrollBy(0, {step});")
+            await asyncio.sleep(1.5)
+            scrolled += 1
+            height = await page.evaluate(
+                "() => document.documentElement.scrollHeight"
+            )
+            if height > last_height:
+                last_height = height
+                no_growth = 0
+            else:
+                no_growth += 1
+                if no_growth >= 2:
+                    logger.info(
+                        f"[collect] 滚动 {scrolled} 次后页面高度不再增长，停止加载"
+                    )
+                    break
+        logger.info(f"[collect] 滚动 {scrolled} 次，页面高度 {last_height}px，开始抽取")
+
+        # 2. 完整 DOM 转 markdown 交给 LLM 抽取结构化商品列表
+        import markdownify
+
+        content = markdownify.markdownify(await page.content())
+        prompt = f"""\
+从商品列表页中提取所有商品，按提取目标整理成结构化列表。如果页面有多个商品，必须全部列出，不要遗漏。
+
+提取目标: {goal}
+
+页面内容:
+{content[:60000]}
+"""
+        collection_function = {
+            "type": "function",
+            "function": {
+                "name": "collect_items",
+                "description": "从商品列表页收集所有商品的结构化信息",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "description": "收集到的商品列表",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": {"type": "string", "description": "商品标题"},
+                                    "price": {"type": "string", "description": "商品价格"},
+                                    "store": {"type": "string", "description": "店铺名称"},
+                                },
+                                "required": ["title", "price", "store"],
+                            },
+                        },
+                    },
+                    "required": ["items"],
+                },
+            },
+        }
+
+        response = await self.llm.ask_tool(
+            [{"role": "system", "content": prompt}],
+            tools=[collection_function],
+            tool_choice="required",
+        )
+
+        if response and response.tool_calls:
+            args = json.loads(response.tool_calls[0].function.arguments)
+            items = args.get("items", [])
+            return ToolResult(
+                output=(
+                    f"已滚动加载并收集 {len(items)} 条商品：\n"
+                    f"{json.dumps(items, ensure_ascii=False, indent=2)}\n"
+                )
+            )
+
+        return ToolResult(error="滚动加载完成，但未能抽取出结构化商品数据")
 
     async def _execute_smart_click(
         self, context: BrowserContext, element_description: str
@@ -1821,61 +2543,63 @@ Page content:
 
             # 策略1: 使用 Playwright locator 精确查找（优先文字精确匹配）
             try:
-                # 尝试精确文字匹配
-                locator = page.get_by_text(element_description, exact=True)
-                if await locator.count() > 0:
-                    # 找到精确匹配，点击第一个可见的
-                    for i in range(await locator.count()):
-                        el = locator.nth(i)
-                        if await el.is_visible():
-                            box = await el.bounding_box()
-                            if box and box['y'] < 600:  # 只点击上半部分页面的元素
-                                click_x = box['x'] + box['width'] / 2
-                                click_y = box['y'] + box['height'] / 2
-                                logger.info(f"[click] 精确匹配: '{element_description}' at ({click_x:.0f}, {click_y:.0f})")
-                                await page.mouse.click(click_x, click_y)
-                                await asyncio.sleep(0.5)
-                                
-                                # 如果是日期选择器相关元素，等待日历弹出
-                                if "日期" in element_description or "date" in element_description.lower() or "calendar" in element_description.lower():
-                                    calendar_opened = await self._wait_for_calendar(page)
-                                    if calendar_opened:
-                                        return ToolResult(
-                                            output=f"[click] 成功点击: '{element_description}' at ({click_x:.0f}, {click_y:.0f})，日历已弹出"
-                                        )
-                                
-                                return ToolResult(
-                                    output=f"[click] 成功点击: '{element_description}' at ({click_x:.0f}, {click_y:.0f})"
-                                )
-
-                # 尝试包含文字匹配（但要求元素文字长度不能太长）
-                locator = page.get_by_text(element_description, exact=False)
-                if await locator.count() > 0:
-                    for i in range(min(await locator.count(), 10)):  # 最多检查10个
-                        el = locator.nth(i)
-                        if await el.is_visible():
-                            text_content = await el.text_content()
-                            # 只接受文字长度不超过描述3倍的元素
-                            if text_content and len(text_content.strip()) <= len(element_description) * 3:
+                # 遍历所有 frame（主文档 + 各 iframe）；Playwright locator 天然穿透 open shadow DOM
+                for frame in page.frames:
+                    # 尝试精确文字匹配
+                    locator = frame.get_by_text(element_description, exact=True)
+                    if await locator.count() > 0:
+                        # 找到精确匹配，点击第一个可见的
+                        for i in range(await locator.count()):
+                            el = locator.nth(i)
+                            if await el.is_visible():
                                 box = await el.bounding_box()
-                                if box and box['y'] < 600:
+                                if box and box['y'] < 600:  # 只点击上半部分页面的元素
                                     click_x = box['x'] + box['width'] / 2
                                     click_y = box['y'] + box['height'] / 2
-                                    logger.info(f"[click] 包含匹配: '{text_content[:30]}' at ({click_x:.0f}, {click_y:.0f})")
+                                    logger.info(f"[click] 精确匹配: '{element_description}' at ({click_x:.0f}, {click_y:.0f})")
                                     await page.mouse.click(click_x, click_y)
                                     await asyncio.sleep(0.5)
-                                    
+
                                     # 如果是日期选择器相关元素，等待日历弹出
                                     if "日期" in element_description or "date" in element_description.lower() or "calendar" in element_description.lower():
                                         calendar_opened = await self._wait_for_calendar(page)
                                         if calendar_opened:
                                             return ToolResult(
-                                                output=f"[click] 成功点击: '{text_content[:30]}' at ({click_x:.0f}, {click_y:.0f})，日历已弹出"
+                                                output=f"[click] 成功点击: '{element_description}' at ({click_x:.0f}, {click_y:.0f})，日历已弹出"
                                             )
-                                    
+
                                     return ToolResult(
-                                        output=f"[click] 成功点击: '{text_content[:30]}' at ({click_x:.0f}, {click_y:.0f})"
+                                        output=f"[click] 成功点击: '{element_description}' at ({click_x:.0f}, {click_y:.0f})"
                                     )
+
+                    # 尝试包含文字匹配（但要求元素文字长度不能太长）
+                    locator = frame.get_by_text(element_description, exact=False)
+                    if await locator.count() > 0:
+                        for i in range(min(await locator.count(), 10)):  # 最多检查10个
+                            el = locator.nth(i)
+                            if await el.is_visible():
+                                text_content = await el.text_content()
+                                # 只接受文字长度不超过描述3倍的元素
+                                if text_content and len(text_content.strip()) <= len(element_description) * 3:
+                                    box = await el.bounding_box()
+                                    if box and box['y'] < 600:
+                                        click_x = box['x'] + box['width'] / 2
+                                        click_y = box['y'] + box['height'] / 2
+                                        logger.info(f"[click] 包含匹配: '{text_content[:30]}' at ({click_x:.0f}, {click_y:.0f})")
+                                        await page.mouse.click(click_x, click_y)
+                                        await asyncio.sleep(0.5)
+
+                                        # 如果是日期选择器相关元素，等待日历弹出
+                                        if "日期" in element_description or "date" in element_description.lower() or "calendar" in element_description.lower():
+                                            calendar_opened = await self._wait_for_calendar(page)
+                                            if calendar_opened:
+                                                return ToolResult(
+                                                    output=f"[click] 成功点击: '{text_content[:30]}' at ({click_x:.0f}, {click_y:.0f})，日历已弹出"
+                                                )
+
+                                        return ToolResult(
+                                            output=f"[click] 成功点击: '{text_content[:30]}' at ({click_x:.0f}, {click_y:.0f})"
+                                        )
             except Exception as e:
                 logger.debug(f"[click] Playwright locator 失败: {e}")
 
@@ -2005,6 +2729,136 @@ Page content:
             logger.error(f"[type] 输入失败: {e}")
             # 最终回退到视觉模型
             return await self._execute_vision_action(context, f"在{element_description}输入'{text}'", "type")
+
+    async def _match_select(self, page, element_description: str):
+        """
+        收集页面所有原生 <select> 下拉框，并用 LLM 匹配 element_description 返回其下标。
+
+        Args:
+            page: Playwright page 对象
+            element_description: 下拉框描述（如 "省份"、"所在城市"）
+
+        Returns:
+            tuple: (selects 列表, 匹配到的下标或 None)
+        """
+        # 遍历所有 frame（主文档 + 各 iframe），frame.locator 天然穿透 open shadow DOM，
+        # 每个元素额外记录 frame_idx/local_idx 供 select_option 精确定位
+        selects = []
+        for frame_idx, frame in enumerate(page.frames):
+            locator = frame.locator("select")
+            for local_idx in range(await locator.count()):
+                meta = await locator.nth(local_idx).evaluate("""
+                    (el) => {
+                        const rect = el.getBoundingClientRect();
+                        let labelText = '';
+                        if (el.id) {
+                            const label = document.querySelector(`label[for="${el.id}"]`);
+                            if (label) labelText = label.textContent?.trim() || '';
+                        }
+                        const parent = el.closest('div, li, label, td');
+                        return {
+                            name: el.getAttribute('name') || '',
+                            ariaLabel: el.getAttribute('aria-label') || '',
+                            labelText: labelText,
+                            parentText: parent ? parent.textContent?.trim().substring(0, 30) : '',
+                            selected: el.options[el.selectedIndex]?.text?.trim() || '',
+                            options: Array.from(el.options).map(o => o.text.trim()),
+                            visible: rect.width > 0 && rect.height > 0 && rect.y >= 0 && rect.y < window.innerHeight,
+                        };
+                    }
+                """)
+                meta["frame_idx"] = frame_idx
+                meta["local_idx"] = local_idx
+                selects.append(meta)
+        if not selects:
+            return [], None
+
+        def _fmt_options(opts):
+            # 真实页面下拉框选项可能上百项（如国家列表），只展示前 8 项供 LLM 匹配，避免 prompt 膨胀
+            shown = opts[:8]
+            return f"{shown} ...共{len(opts)}项" if len(opts) > 8 else str(shown)
+
+        selects_text = "\n".join([
+            f"[{i}] label='{s['labelText']}' name='{s['name']}' parent='{s['parentText']}' selected='{s['selected']}' options={_fmt_options(s['options'])} visible={s['visible']}"
+            for i, s in enumerate(selects)
+        ])
+
+        prompt = f"""找到最匹配的下拉框（select）。
+
+用户想操作的下拉框: {element_description}
+
+下拉框列表:
+{selects_text}
+
+返回最匹配的下拉框索引（只返回数字，如: 0）。如果没有匹配项，返回 -1。"""
+
+        response = await self.llm.ask(
+            messages=[{"role": "user", "content": prompt}],
+            system_msgs=[{"role": "system", "content": "你是一个精确的页面元素匹配器。只返回元素索引数字。"}],
+        )
+
+        idx = None
+        match = re.search(r'-?\d+', response)
+        if match:
+            parsed = int(match.group())
+            if 0 <= parsed < len(selects):
+                idx = parsed
+        return selects, idx
+
+    async def _get_dropdown_options(self, context: BrowserContext, element_description: str) -> ToolResult:
+        """
+        获取原生 <select> 下拉框的可选列表，用于级联表单「先看后选」。
+        """
+        try:
+            page = await context.get_current_page()
+            await page.bring_to_front()
+            await page.wait_for_load_state()
+
+            selects, idx = await self._match_select(page, element_description)
+            if idx is None:
+                return ToolResult(error=f"未找到匹配的下拉框: {element_description}")
+
+            sel = selects[idx]
+            logger.info(f"[select] 匹配到下拉框 [{idx}]: selected='{sel['selected']}', options={sel['options']}")
+            return ToolResult(
+                output=f"下拉框 '{element_description}' 当前选中 '{sel['selected']}'，可选项: {json.dumps(sel['options'], ensure_ascii=False)}"
+            )
+        except Exception as e:
+            logger.error(f"[select] 获取下拉框选项失败: {e}")
+            return ToolResult(error=f"获取下拉框选项失败: {e}")
+
+    async def _select_dropdown_option(self, context: BrowserContext, element_description: str, option: str) -> ToolResult:
+        """
+        选择原生 <select> 下拉框的某个选项，select_option 会自动触发 change 事件驱动级联刷新。
+        """
+        try:
+            page = await context.get_current_page()
+            await page.bring_to_front()
+            await page.wait_for_load_state()
+
+            selects, idx = await self._match_select(page, element_description)
+            if idx is None:
+                return ToolResult(error=f"未找到匹配的下拉框: {element_description}")
+
+            sel = selects[idx]
+            if option not in sel["options"]:
+                return ToolResult(
+                    error=f"选项 '{option}' 不在下拉框 '{element_description}' 的可选项中: {json.dumps(sel['options'], ensure_ascii=False)}"
+                )
+
+            # label= 匹配选项文本（原生 select 无 label 属性时等价于文本内容）
+            select_locator = page.frames[sel["frame_idx"]].locator("select").nth(sel["local_idx"])
+            await select_locator.select_option(label=option)
+
+            # 等待级联下拉框刷新
+            await asyncio.sleep(0.5)
+
+            selected = await select_locator.evaluate("el => el.options[el.selectedIndex]?.text?.trim() || ''")
+            logger.info(f"[select] 已在下拉框 '{element_description}' 选择 '{selected}'")
+            return ToolResult(output=f"已在下拉框 '{element_description}' 选择: {selected}")
+        except Exception as e:
+            logger.error(f"[select] 选择下拉框选项失败: {e}")
+            return ToolResult(error=f"选择下拉框选项失败: {e}")
 
     async def get_current_state(
         self, context: Optional[BrowserContext] = None

@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>模拟电商商品列表（无限滚动）</title>
+<style>
+  body { font-family: "Microsoft YaHei", sans-serif; margin: 0; background: #f5f5f5; }
+  .header { position: sticky; top: 0; background: #fff; padding: 12px 20px; border-bottom: 1px solid #eee; z-index: 10; }
+  .search-bar { display: flex; gap: 8px; max-width: 700px; margin: 0 auto; }
+  .search-bar input { flex: 1; padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; }
+  .search-bar button { padding: 8px 20px; border: none; background: #e4393c; color: #fff; border-radius: 4px; cursor: pointer; }
+  #list { max-width: 700px; margin: 20px auto; padding: 0 16px; }
+  .item { display: flex; gap: 12px; background: #fff; margin-bottom: 12px; padding: 12px; border-radius: 6px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
+  .item .thumb { width: 80px; height: 80px; background: #e8e8e8; border-radius: 4px; flex-shrink: 0; }
+  .item .info { flex: 1; min-width: 0; }
+  .item .title { font-size: 15px; line-height: 1.4; margin-bottom: 6px; color: #333; }
+  .item .store { color: #999; font-size: 12px; margin-bottom: 4px; }
+  .item .price { color: #e4393c; font-size: 18px; font-weight: bold; }
+  #loading { text-align: center; color: #999; padding: 20px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="search-bar">
+    <input value="蓝牙耳机" readonly>
+    <button>搜索</button>
+  </div>
+</div>
+<div id="list"></div>
+<div id="loading">加载中...</div>
+<script>
+  var list = document.getElementById('list');
+  var loading = document.getElementById('loading');
+  var index = 0;
+  var total = 30;
+  var stores = ['华为官方旗舰店', '小米官方旗舰店', '漫步者旗舰店', '网易严选', '京东京造官方旗舰店', '索尼影音旗舰店', '声阔官方旗舰店'];
+
+  function makeItem(i) {
+    var div = document.createElement('div');
+    div.className = 'item';
+    var price = (89 + (i * 37) % 400) + '.' + String((i * 13) % 100).padStart(2, '0');
+    div.innerHTML =
+      '<div class="thumb"></div>' +
+      '<div class="info">' +
+        '<div class="title">真无线蓝牙耳机 第' + (i + 1) + '款 主动降噪 长续航</div>' +
+        '<div class="store">' + stores[i % stores.length] + '</div>' +
+        '<div class="price">¥' + price + '</div>' +
+      '</div>';
+    return div;
+  }
+
+  var loadingBatch = false;
+  function loadBatch() {
+    if (loadingBatch) return;
+    loadingBatch = true;
+    loading.style.display = 'block';
+    setTimeout(function () {
+      for (var k = 0; k < 10 && index < total; k++) {
+        list.appendChild(makeItem(index));
+        index++;
+      }
+      loading.style.display = index >= total ? 'none' : 'block';
+      loadingBatch = false;
+    }, 600);
+  }
+
+  window.addEventListener('scroll', function () {
+    if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 100) {
+      loadBatch();
+    }
+  });
+
+  loadBatch();
+</script>
+</body>
+</html>

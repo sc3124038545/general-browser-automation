@@ -8,6 +8,19 @@ data/
 # Workspace
 workspace/
 
+# 本地 Claude Code 配置（含机器相关路径，不提交）
+.claude/settings.local.json
+
+# 浏览器自动化运行时调试产物（截图等）
+debug_html/*.png
+debug_html/*.jpg
+
+# 测试运行日志与临时诊断脚本
+tests/*.log
+tests/diag_*.py
+tests/dump_*.py
+tests/probe_*.py
+
 ### Python ###
 # Byte-compiled / optimized / DLL files
 __pycache__/
