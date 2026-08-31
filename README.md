@@ -461,7 +461,3 @@ A: 各大电商反爬强度差异很大。京东、淘宝、拼多多基本会�
 ## 致谢
 
 本项目基于 [OpenManus](https://github.com/FoundationAgents/OpenManus) 开发，感谢原作者的杰出工作。同时也感谢 [anthropic-computer-use](https://github.com/anthropics/anthropic-quickstarts)、[browser-use](https://github.com/browser-use/browser-use)、[MetaGPT](https://github.com/geekan/MetaGPT) 等项目提供的灵感和基础支持。
-
-## 许可证
-
-[MIT License](LICENSE)
